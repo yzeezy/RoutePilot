@@ -6,6 +6,7 @@ docs/
 .workbuddy/
 .superpowers/
 .kimi-code/
+.dsh/
 
 # ---- Python ----
 __pycache__/
