@@ -36,14 +36,15 @@ def test_worker_background_loop_loads_changed_file(tmp_path):
     ModelRepo(conn).create("fast", "fast", "local", json.dumps({"capability": "快速"}))
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=direct_graph("fast"))))
-    repo.enable("main")
-    app = SimpleNamespace(state=SimpleNamespace(settings=settings, snapshot=None))
+    repo.create(tree_from_dict(tree_dict(
+        root=direct_graph("fast"), enabled=True, default=True)))
+    app = SimpleNamespace(state=SimpleNamespace(settings=settings, snapshot_set=None))
     app.state.publisher = SnapshotPublisher(app, repo)
     app.state.publisher.refresh(conn)
 
     updated = tree_from_dict(tree_dict(
         root=direct_graph("fast"), sticky={"enabled": True, "ttl_seconds": 60},
+        enabled=True, default=True,
     ))
     repo.update(updated, base_document_sha256=repo.get("main").document_sha256)
 
@@ -52,7 +53,7 @@ def test_worker_background_loop_loads_changed_file(tmp_path):
         await worker.start()
         try:
             for _ in range(100):
-                if app.state.snapshot.tree.sticky.ttl_seconds == 60:
+                if app.state.snapshot_set.default_snapshot.tree.sticky.ttl_seconds == 60:
                     return
                 await asyncio.sleep(0.01)
             raise AssertionError("background reload did not converge within one second")

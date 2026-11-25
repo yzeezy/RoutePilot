@@ -1,6 +1,6 @@
-"""跨运行时图契约：同一组 v3 fixture 同时驱动 Python 服务端与 Node 控制台。
+"""跨运行时图契约：同一组 v4 fixture 同时驱动 Python 服务端与 Node 控制台。
 
-每项 fixture 是手写的 ``sr-routing-graph`` v3 文档，含：
+每项 fixture 是手写的 ``sr-routing-graph`` v4 文档，含：
 
 * ``issue_codes``：硬校验码集合（排序、去重、不含 hint）；
 * ``behavior_sha256``：有效文档的 ``tree_revision_of``（hash of
@@ -39,6 +39,7 @@ REQUIRED_FIXTURES = {
     "valid-condition-periods",
     "valid-small-float-threshold",
     "valid-envelope-variation",
+    "valid-unicode-departments",
     "valid-old-field-control",
     "valid-self-contained-runtime",
     "invalid-runtime-api-key",
@@ -60,7 +61,6 @@ def python_contract(document: dict) -> tuple[list[str], str | None]:
         tree = parse_graph_document(
             raw,
             tree_id="contract",
-            enabled=False,
             updated_at="",
             document_sha256="",
         )
@@ -148,6 +148,11 @@ def test_fixture_set_covers_the_contract_matrix() -> None:
     )
     envelope = BY_NAME["valid-envelope-variation"]["document"]
     assert envelope["timezone"] != "Asia/Shanghai"
+    unicode_departments = BY_NAME["valid-unicode-departments"]["document"]["departments"]
+    assert unicode_departments and any(
+        ord(char) > 0xFFFF for value in unicode_departments for char in value
+    ), "no non-BMP department in the valid fixture set"
+
     assert envelope["sticky"] == {"enabled": False, "ttl_seconds": 600}
     assert envelope["root"]["error_fallback"] == "target-a"
     old_document = BY_NAME["invalid-old-otherwise-target"]["document"]
@@ -181,7 +186,6 @@ def test_self_contained_runtime_fixture_pins_the_behavior_normalization() -> Non
         return parse_graph_document(
             json.dumps(document, ensure_ascii=False).encode("utf-8"),
             tree_id="contract",
-            enabled=False,
             updated_at="",
             document_sha256="",
         )

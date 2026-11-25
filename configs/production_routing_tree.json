@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "默认决策组",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -212,6 +212,8 @@
     ]
   },
   "jev": {
+    "id": "default",
+    "key_env": "ROUTER_JEV_API_KEY",
     "base_url": "http://127.0.0.1:8100",
     "model": "d1-2b",
     "timeout_seconds": 10.0,
@@ -258,5 +260,8 @@
       "start": "00:00",
       "end": "00:00"
     }
-  ]
+  ],
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

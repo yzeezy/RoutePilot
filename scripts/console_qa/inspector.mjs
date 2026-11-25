@@ -12,19 +12,24 @@ import {
   BASELINE,
   EXAMPLE_EDGES,
   EXAMPLE_NODES,
+  SECONDARY_JEV_ID,
   TREE_ID,
   api,
   appSnapshot,
   blankPoint,
+  clickCanvasAction,
   clickEdge,
   clickNode,
+  clearToasts,
   danglingEdgeIds,
-  dirtyBadge,
+  draftStatus,
   dragPort,
   edgeOf,
   ensureBaselineTree,
+  expectHttpStatusError,
   expectNever,
   issueCodes,
+  mockBase,
   openCanvas,
   openIssuesPanel,
   page,
@@ -33,9 +38,11 @@ import {
   screenshot,
   serverTree,
   test,
+  toastText,
   waitCondPop,
   waitFor,
-  waitInspectorBranch
+  waitInspectorBranch,
+  waitToastIncludes
 } from '../console_qa.mjs';
 
 test('7.4-07-selected-edge-inspector', async () => {
@@ -81,7 +88,7 @@ test('7.4-07-selected-edge-inspector', async () => {
   assert.deepEqual(await danglingEdgeIds(), []);
   assert.equal((await issueCodes()).includes('edge_port_missing'), false);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async id => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.edges.some(edge => edge.id === id));
@@ -195,11 +202,9 @@ test('7.4-09-question-target-rows', async () => {
   const rows = page.locator('#cvNodes [data-node-id="capability"] .rtc-slot');
   assert.match(await rows.nth(0).innerText(), /开始/);
   assert.match(await rows.nth(0).innerText(), /in_1/);
-  assert.equal((await rows.nth(0).locator('[data-start-condition]').textContent()).trim(),
-    await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.cond.startAlways'));
-}));
+  assert.equal(await rows.nth(0).locator('[data-start-condition]').count(), 0,
+    'the start slot still renders a condition chip');
+  assert.doesNotMatch(await rows.nth(0).innerText(), /总是通过|Always passes/);
   assert.match(await rows.nth(1).innerText(), /文本条件/);
   assert.equal((await rows.nth(1).locator('[data-cond-edge]').textContent()).trim(),
     await page.evaluate(async () => {
@@ -277,7 +282,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(ports.includes('selected.easy'), false);
   assert.equal(await page.locator('#cvNodes [data-node-id="capability"] [data-optkey="light"]').count(), 1);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.edges.some(edge => edge.source_port === 'selected.easy'));
@@ -351,7 +356,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.deepEqual((await appSnapshot()).history, { undo: true, redo: false },
     'two-key swap must be exactly one history entry');
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -405,7 +410,7 @@ const RTGraph = await import('/console/routing/graph.js');
     RTGraph.findNode(app.graph, 'cond-text'))));
 }), condTextBefore,
   'inspector save wrote to the silently moved kit selection');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -493,7 +498,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(saved.options.find(option => option.key === 'easy').label, '轻量档');
   assert.deepEqual(saved.options.find(option => option.key === 'medium'),
     { key: 'medium', label: '中档模型', capability: '中等复杂度写作与总结。' });
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -528,7 +533,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }),
     ['抢修', '停电', '电梯', '故障']);
   assert.equal(await page.locator('#cvNodes [data-node-id="cond-text"] [data-kw="电梯"]').count(), 1);
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -554,7 +559,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }),
     ['peak', 'normal']);
   assert.equal(await page.locator('#cvNodes [data-node-id="cond-peak"] [data-period="normal"]').count(), 1);
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -583,7 +588,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }, scoreIds[0]);
 });
 
-test('Task 11 · logic and target inspectors edit operator, models, reasoning, priority and strategy with guards', async () => {
+test('Task 11 · logic and target inspectors edit operator, models, reasoning and priority with guards', async () => {
   await openCanvas();
   await clickNode('and-power');
   await waitInspectorBranch('node', 'and-power');
@@ -599,7 +604,7 @@ const RTGraph = await import('/console/routing/graph.js');
     return (RTGraph.findNode(app.graph, 'and-power').operator === 'or');
 });
   assert.equal(await page.locator('#cvNodes [data-node-id="and-power"]').getAttribute('data-operator'), 'or');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -635,8 +640,6 @@ const RTGraph = await import('/console/routing/graph.js');
   await page.locator('#cvInspectorBody [data-field="priority"]').fill('7');
   await page.locator('#cvInspectorBody [data-model-field="model"]').first().selectOption('deepseek-v3');
   await page.locator('#cvInspectorBody [data-model-field="reasoning"]').first().selectOption('high');
-  await page.locator('#cvInspectorBody [data-field="strategy"]').selectOption('least_inflight');
-  await page.locator('#cvInspectorBody [data-field="capability"]').fill('强推理通用模型：复杂分析。');
   await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -653,9 +656,10 @@ const RTGraph = await import('/console/routing/graph.js');
     return (JSON.parse(JSON.stringify(
     RTGraph.findNode(app.graph, 'strong-target'))));
 });
-  assert.equal(target.strategy, 'least_inflight');
-  assert.equal(target.capability, '强推理通用模型：复杂分析。');
-  await page.locator('#cvUndo').click();
+  /* 调度策略与目标能力描述已下线：提交后不应再写回这两个字段。 */
+  assert.equal('strategy' in target, false);
+  assert.equal('capability' in target, false);
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -736,7 +740,7 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.error_fallback);
 }), 'power-target');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === expected.name &&
@@ -745,6 +749,172 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
     app.graph.error_fallback === 'light-target');
 }, BASELINE);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
+});
+
+test('Task 9 · graph settings choose a JEV and refresh the runtime from the database catalog', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  await waitInspectorBranch('graph', 'root');
+
+  /* JEV 下拉来自数据库 JEV 目录；首项是「不使用 JEV」，当前快照的 default 选中。 */
+  const options = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-field="jev"] option'))
+    .map(option => ({ value: option.value, text: option.textContent.trim() })));
+  assert.equal(options[0].value, '', 'the JEV select has no "no JEV" option');
+  assert.equal(options[0].text, await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return t('cv.ins.jevNone');
+}));
+  const defaultOption = options.find(option => option.value === 'default');
+  assert.ok(defaultOption, 'the database JEV default service is missing from the select');
+  assert.match(defaultOption.text, /default · d1-2b/, 'JEV option does not show id · model');
+  const secondaryOption = options.find(option => option.value === SECONDARY_JEV_ID);
+  assert.ok(secondaryOption, 'the second database JEV service is missing from the select');
+  assert.match(secondaryOption.text, new RegExp(SECONDARY_JEV_ID + ' · ' + 'd1-2B'),
+    'JEV option label does not include the model');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="jev"]').inputValue(), 'default');
+  assert.match(await page.locator('#cvInspectorBody [data-runtime-summary]').textContent(), /1024\/4096/,
+    'the runtime summary does not show the canvas JEV window');
+
+  /* 应用 JEV 选择 = 同一个历史项里替换 runtime.jev 与 runtime.jev_window（原子）。 */
+  const historyBefore = await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+});
+  await page.locator('#cvInspectorBody [data-field="jev"]').selectOption(SECONDARY_JEV_ID);
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return !!(app.tree.runtime && app.tree.runtime.jev &&
+      app.tree.runtime.jev.id === 'jev-secondary');
+}, null, { timeout: 8000 });
+  const applied = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({
+    jev: app.tree.runtime.jev,
+    window: app.tree.runtime.jev_window,
+    kind: app.kind(),
+    history: store.undoStack.length
+});
+});
+  assert.deepEqual(applied.window, { input_tokens: 2048, context_tokens: 8192 },
+    'the JEV selection did not replace the window from the same service');
+  assert.equal(applied.kind, 'behavior');
+  assert.equal(applied.history, historyBefore + 1,
+    'JEV selection + graph settings were not a single history entry');
+  assert.equal(applied.jev.base_url, mockBase);
+
+  /* 撤销必须同时恢复服务与窗口（不允许混用两个服务的配置）。 */
+  await clickCanvasAction('cvUndo');
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return !!(app.tree.runtime && app.tree.runtime.jev &&
+      app.tree.runtime.jev.id === 'default' &&
+      app.tree.runtime.jev_window.input_tokens === 1024 &&
+      app.tree.runtime.jev_window.context_tokens === 4096);
+}, null, { timeout: 8000 });
+
+  /* 含问题节点时选择「不使用 JEV」是本地硬错误：不写历史、不改草稿。 */
+  const beforeReject = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({ history: store.undoStack.length, jev: app.tree.runtime.jev });
+});
+  await page.locator('#cvInspectorBody [data-field="jev"]').selectOption('');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => {
+    const error = document.querySelector('#cvInspectorBody [data-ins-error]');
+    return error && !error.hidden && error.textContent.trim().length > 0;
+});
+  assert.equal((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(),
+    await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return t('cv.ins.errJevRequired');
+}), 'a question canvas accepted "no JEV"');
+  const afterReject = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({ history: store.undoStack.length, jev: app.tree.runtime.jev, kind: app.kind() });
+});
+  assert.deepEqual(afterReject, Object.assign({}, beforeReject, { kind: 'clean' }),
+    'a rejected JEV selection mutated the draft or history');
+
+  /* 「从数据库刷新运行配置」：基线快照与目录逐字段一致 → 无变更提示、不写历史。 */
+  const beforeRefresh = await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+});
+  await page.locator('#cvInspectorBody [data-act="ins-refresh-runtime"]').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const { t } = await import('/console/i18n.js');
+    return app.lastToast === t('cv.ins.runtimeUnchanged');
+}, null, { timeout: 8000 });
+  assert.equal(await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+}), beforeRefresh, 'a no-op runtime refresh pushed history');
+
+  /* 目录漂移的画布：快照 provider/JEV 端点与数据库不同，刷新必须从目录重建快照。 */
+  const drifted = JSON.parse(JSON.stringify(baseline));
+  const driftedId = 'qa-runtime-refresh';
+  drifted.backends.providers = drifted.backends.providers.map(provider =>
+    Object.assign({}, provider, { base_url: 'http://stale-provider.test/v1' }));
+  drifted.jev = Object.assign({}, drifted.jev, { base_url: 'http://stale-jev.test' });
+  await api('POST', '/admin/trees', {
+    id: driftedId,
+    name: '目录漂移的画布',
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: drifted.root,
+    canvas: drifted.canvas,
+    backends: drifted.backends,
+    jev: drifted.jev,
+    jev_window: drifted.jev_window,
+    time_periods: drifted.time_periods
+});
+  await page.evaluate(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return app.selectTree(id);
+}, driftedId);
+  await waitFor(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.treeId === id && app.booted && app.kind() === 'clean');
+}, driftedId, { timeout: 8000 });
+  await waitInspectorBranch('graph', 'root');
+  const refreshHistory = await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+});
+  await page.locator('#cvInspectorBody [data-act="ins-refresh-runtime"]').click();
+  const refreshedProviderUrl = mockBase + '/v1';
+  await waitFor(async expected => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime.backends.providers[0].base_url === expected;
+}, refreshedProviderUrl, { timeout: 8000 });
+  const refreshed = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({
+    provider: app.tree.runtime.backends.providers[0].base_url,
+    jev: app.tree.runtime.jev.base_url,
+    window: app.tree.runtime.jev_window,
+    kind: app.kind(),
+    history: store.undoStack.length
+});
+});
+  assert.equal(refreshed.jev, mockBase, 'refresh did not replace the canvas JEV endpoint from the catalog');
+  assert.deepEqual(refreshed.window, { input_tokens: 1024, context_tokens: 4096 });
+  assert.equal(refreshed.kind, 'behavior');
+  assert.equal(refreshed.history, refreshHistory + 1, 'refresh was not a single history entry');
+  await clickCanvasAction('cvUndo');
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime.backends.providers[0].base_url === 'http://stale-provider.test/v1';
+}, null, { timeout: 8000 });
+  assert.equal(await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime.jev.base_url;
+}), 'http://stale-jev.test', 'undo did not restore the pre-refresh JEV snapshot');
+  await ensureBaselineTree();
+  await openCanvas();
 });
 
 test('Task 11 · Backspace inside editor inputs is safe, all overlays close with Esc and labels are locatable', async () => {
@@ -835,7 +1005,7 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
 }
 });
 
-test('Task 12 · timezone/sticky are behavior while title/capability/name are display changes', async () => {
+test('Task 12 · timezone/sticky are behavior while title/name are display changes', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
   await waitInspectorBranch('graph', 'root');
@@ -845,13 +1015,14 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.timezone === 'UTC');
 });
-  let badge = await dirtyBadge();
+  let badge = await draftStatus();
   assert.equal(badge.kind, 'behavior', 'timezone change was not classified as behavior');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirty'));
+    return (t('cv.status.unpublished'));
 }));
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.timezone === expected && app.kind() === 'clean');
@@ -865,17 +1036,21 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.find(node => node.id === 'capability').title === '能力分档（展示标题）');
 });
-  assert.equal((await dirtyBadge()).kind, 'display', 'question title was not classified as display');
+  badge = await draftStatus();
+  assert.equal(badge.kind, 'display', 'question title was not classified as display');
+  assert.equal(badge.state, 'unpublished');
 
   await clickNode('strong-target');
   await waitInspectorBranch('node', 'strong-target');
-  await page.locator('#cvInspectorBody [data-field="capability"]').fill('强推理（展示说明）');
+  await page.locator('#cvInspectorBody [data-field="title"]').fill('强推理（展示标题）');
   await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app.graph.nodes.find(node => node.id === 'strong-target').capability === '强推理（展示说明）');
+    return (app.graph.nodes.find(node => node.id === 'strong-target').title === '强推理（展示标题）');
 });
-  assert.equal((await dirtyBadge()).kind, 'display', 'target capability was not classified as display');
+  badge = await draftStatus();
+  assert.equal(badge.kind, 'display', 'target title was not classified as display');
+  assert.equal(badge.state, 'unpublished');
 
   await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -888,11 +1063,12 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === '展示字段决策组');
 });
-  badge = await dirtyBadge();
+  badge = await draftStatus();
   assert.equal(badge.kind, 'display', 'tree name was not classified as display');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirty'));
+    return (t('cv.status.unpublished'));
 }));
 
   await saveNow();
@@ -901,7 +1077,59 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     'a display-only save changed the server tree_revision');
   assert.equal(server.name, '展示字段决策组');
   assert.equal(server.root.nodes.find(node => node.id === 'capability').title, '能力分档（展示标题）');
-  assert.equal(server.root.nodes.find(node => node.id === 'strong-target').capability, '强推理（展示说明）');
+  assert.equal(server.root.nodes.find(node => node.id === 'strong-target').title, '强推理（展示标题）');
+});
+
+test('P0 inspector applies to draft and lifecycle explains publish state', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  const apply = page.locator('#cvInspectorBody [data-act="ins-save-node"]');
+  assert.equal((await apply.textContent()).trim(), await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return t('cv.ins.apply');
+  }));
+  const writes = [];
+  const onRequest = request => {
+    if (request.method() !== 'PUT' && request.method() !== 'POST') return;
+    const path = new URL(request.url()).pathname;
+    if (path === '/admin/trees/' + TREE_ID || path === '/admin/trees/' + TREE_ID + '/enable') {
+      writes.push(request.method() + ' ' + path);
+    }
+  };
+  page.on('request', onRequest);
+  try {
+    await page.locator('#cvInspectorBody [data-field="instructions"]').fill('P0 只应用到草稿');
+    await apply.click();
+    await waitFor(async () => {
+      const badge = document.getElementById('cvLifecycle');
+      return badge && badge.dataset.state === 'unpublished';
+    });
+    /* Inspector Apply is local-only: no tree write may leave the page. */
+    await page.waitForTimeout(120);
+    assert.deepEqual(writes, [], 'inspector Apply wrote the draft to the server');
+    assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
+      await page.evaluate(async () => {
+        const { t } = await import('/console/i18n.js');
+        return t('cv.publishUpdate');
+      }), 'a dirty enabled group must offer Save and update');
+    /* The toolbar primary is the one action that publishes the draft. */
+    await clickCanvasAction('cvEnable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.kind() === 'clean' &&
+        document.getElementById('cvLifecycle').dataset.state === 'running';
+    }, null, { timeout: 8000 });
+    assert.deepEqual(writes, ['PUT /admin/trees/' + TREE_ID],
+      'the toolbar publish did not issue exactly one server save');
+    assert.equal(await page.locator('#cvRevision').count(), 0);
+    assert.equal(await page.locator('#cvClean').count(), 0);
+    assert.equal(await page.locator('#cvDirty').count(), 0);
+    assert.equal(await page.locator('#cvEnabled').count(), 0);
+  } finally {
+    page.off('request', onRequest);
+  }
 });
 
 test('review-inspector-adds-input-connection', async () => {
@@ -933,9 +1161,10 @@ test('review-inspector-adds-input-connection', async () => {
     'canvas slot row did not become occupied');
   assert.match(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"]').innerText(), /开始/,
     'canvas slot row does not show the new source');
-  const badge = await dirtyBadge();
-  assert.equal(badge.hidden, false, 'inspector connection did not mark the draft dirty');
-  assert.equal(badge.appKind, 'behavior');
+  const badge = await draftStatus();
+  assert.equal(badge.visible, true, 'inspector connection did not mark the draft dirty');
+  assert.equal(badge.kind, 'behavior');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (store.canUndo);
@@ -943,7 +1172,7 @@ test('review-inspector-adds-input-connection', async () => {
     'inspector connection did not produce one history entry');
 });
 
-test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', async () => {
+test('review-target-card-shows-name-model-and-fallback-roles', async () => {
   await ensureBaselineTree();
   await openCanvas();
 
@@ -953,8 +1182,7 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
     'target card header still shows only the model name');
   assert.match(await otherwiseCard.locator('.rtc-tbody').innerText(), /deepseek-v3/,
     'target card body does not show its model');
-  assert.equal((otherwiseText.match(/最少在途请求/g) || []).length, 1,
-    'target card renders the strategy more than once');
+  assert.doesNotMatch(otherwiseText, /最少在途请求|调度策略/);
   assert.doesNotMatch(otherwiseText, /兜底模型/);
 
   const errorCard = page.locator('#cvNodes [data-node-id="light-target"]');
@@ -967,9 +1195,188 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
 
   await clickNode('standard-target');
   await waitInspectorBranch('node', 'standard-target');
-  assert.equal(
-    (await page.locator('#cvInspectorBody [data-field="strategy"] option:checked').textContent()).trim(),
-    '最少在途请求');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="strategy"]').count(), 0,
+    'target inspector still exposes the removed scheduling strategy');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="capability"]').count(), 0,
+    'target inspector still exposes the removed capability description');
+});
+
+test('Task 9 · runtime refresh refuses to drop a period still referenced by a condition node', async () => {
+  const baseline = await ensureBaselineTree();
+  assert.ok(Array.isArray(baseline.time_periods), 'the baseline tree has no runtime periods');
+  /* 模拟 /admin/time-periods 失败/漂移后的目录：少了条件节点 cond-peak 引用的
+     peak（app.js loadCatalog 会吞掉失败并把 periods 置空，后果相同）。 */
+  const catalogPeriods = baseline.time_periods.filter(period => period.name !== 'peak');
+  assert.deepEqual(catalogPeriods.map(period => period.name), ['normal', 'offpeak'],
+    'the baseline catalog periods changed; this case needs peak as a referenced period');
+  const periodsRoute = url => url.pathname === '/admin/time-periods';
+  await page.route(periodsRoute, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ periods: catalogPeriods })
+  }));
+  try {
+    await openCanvas();
+    await waitInspectorBranch('graph', 'root');
+    const snapshot = () => page.evaluate(async () => {
+      const { app, store } = await import('/console/routing/app.js');
+      const condition = app.graph.nodes.find(node => node.id === 'cond-peak');
+      return {
+        kind: app.kind(),
+        history: store.undoStack.length,
+        runtimePeriods: app.tree.runtime.time_periods.map(period => period.name),
+        conditionPeriods: condition.periods.slice(),
+        enabled: app.tree.enabled
+      };
+    });
+    const before = await snapshot();
+    assert.deepEqual(before.runtimePeriods, ['peak', 'normal', 'offpeak']);
+    assert.deepEqual(before.conditionPeriods, ['peak']);
+    const expected = await page.evaluate(async () => {
+      const { tf } = await import('/console/i18n.js');
+      return tf('cv.runtime.errPeriodsMissing', { periods: 'peak' });
+    });
+    await page.locator('#cvInspectorBody [data-act="ins-refresh-runtime"]').click();
+    /* 刷新必须点名拒绝：静默把 time_periods 刷成 [] 会在服务端 enable 时报
+       unknown_period（本地 validate 不查时段目录）。 */
+    await page.waitForFunction(message => {
+      const box = document.querySelector('#cvInspectorBody [data-ins-error]');
+      return !!box && !box.hidden && box.textContent.includes(message);
+    }, expected, { timeout: 6000 });
+    assert.equal((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(),
+      expected, 'the refresh error did not name the missing period');
+    assert.ok(expected.includes('peak'), 'the refresh error did not name "peak": ' + expected);
+    assert.deepEqual(await snapshot(), before,
+      'a refused refresh mutated the draft runtime or pushed history');
+  } finally {
+    await page.unroute(periodsRoute);
+    await ensureBaselineTree();
+    await openCanvas();
+  }
+});
+
+
+test('Task 9 · departments: graph settings edit/sort, duplicate hint and cross-graph conflict', async () => {
+  /* Task 9 的真实浏览器场景：部门编辑在「图设置」里完成，保存仍走 controller.save()；
+     服务端负责排序与跨启用图唯一性。本地重复只提示；跨图冲突必须显示服务端
+     department_conflict Issue（含部门名与涉事图 id），且第一张图的服务端部门不变。
+     场景末尾顺带锁住 dirty 草稿在启停时保留未保存部门编辑（syncLifecycleBaseline）。 */
+  const OTHER = 'dept-conflict';
+  const listedTree = async id =>
+    (await api('GET', '/admin/trees')).trees.find(tree => tree.id === id);
+  try {
+    await ensureBaselineTree();
+    /* 先建第二张图并启用：副本继承源图当时的部门（基线为空），因此后续给源图
+       配部门不会先在副本里制造冲突。 */
+    if (!(await listedTree(OTHER))) {
+      await api('POST', '/admin/trees/' + TREE_ID + '/copy', { id: OTHER, name: '部门冲突图' });
+    }
+    await api('POST', '/admin/trees/' + OTHER + '/enable');
+
+    await openCanvas();
+    await waitInspectorBranch('graph', 'root');
+    assert.equal(await page.locator('#cvDepartments').count(), 1,
+      'graph settings must offer a departments input');
+    assert.equal(await page.locator('#cvDepartments').inputValue(), '',
+      'a fresh baseline graph must start with no departments');
+    assert.equal(await page.locator('#cvDepartments').getAttribute('data-field'), 'departments');
+
+    /* 1) 输入含重复 + 未排序：本地去重并立即给本地化提示；提交后草稿已排序。 */
+    const duplicateHint = await page.evaluate(async () => {
+      const { tf } = await import('/console/i18n.js');
+      return tf('cv.ins.departmentsDupHint', { departments: '财务部' });
+    });
+    await clearToasts();
+    await page.locator('#cvDepartments').fill('财务部, 财务部, 法务部');
+    await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+    await waitToastIncludes(duplicateHint);
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return JSON.stringify(app.tree.departments) === JSON.stringify(['法务部', '财务部']);
+    }, null, { timeout: 5000 });
+    assert.equal(await page.locator('#cvDepartments').inputValue(), '法务部, 财务部',
+      'the graph settings input must round-trip the sorted departments');
+    assert.equal((await appSnapshot()).kind, 'behavior',
+      'editing departments must be a behavior change');
+
+    /* 2) 保存：服务端排序后的部门原样落盘（服务端是排序的事实源）。 */
+    await saveNow();
+    const source = await serverTree(TREE_ID);
+    assert.deepEqual(source.departments, ['法务部', '财务部'],
+      'saved departments are not sorted by the server');
+    assert.deepEqual((await listedTree(OTHER)).departments, [],
+      'the other enabled graph must not inherit the source departments');
+
+    /* 3) 在另一张启用图配置同一部门：保存被 422 department_conflict 拒绝，
+        Issues 条展示部门名与冲突图 id，第一张图服务端部门保持不变。 */
+    await page.locator('#cvTreeSelect').selectOption(OTHER);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return app.treeId === id && app.changeKind === 'clean';
+    }, OTHER, { timeout: 8000 });
+    await waitInspectorBranch('graph', 'root');
+    await page.locator('#cvDepartments').fill('财务部');
+    await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return JSON.stringify(app.tree.departments) === JSON.stringify(['财务部']);
+    }, null, { timeout: 5000 });
+    expectHttpStatusError({ url: new RegExp('/admin/trees/' + OTHER + '$'), status: /422/ });
+    await clickCanvasAction('cvSave');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.issues || []).some(issue => issue.code === 'department_conflict');
+    }, null, { timeout: 10000 });
+    assert.deepEqual(await issueCodes(), ['department_conflict'],
+      'the conflict was not surfaced as a single hard department_conflict issue');
+    await waitFor(() => !document.getElementById('cvIssues').hidden);
+    const issueText = (await page.locator('#cvIssues').innerText()).replace(/\s+/g, ' ');
+    assert.ok(issueText.includes('财务部'), 'the conflict issue does not name the department');
+    assert.ok(issueText.includes(TREE_ID), 'the conflict issue does not name the conflicting graph id');
+    assert.deepEqual((await serverTree(TREE_ID)).departments, ['法务部', '财务部'],
+      'a rejected save mutated the first graph departments');
+    assert.deepEqual((await serverTree(OTHER)).departments, [],
+      'a rejected save wrote the conflicting departments');
+
+    /* 4) 已知问题的回归（Task 9）：脏草稿的部门编辑不得被启停回包覆盖。
+       当前图仍是脏的（财务部 未保存）——直接停用，本地部门必须原样保留，
+       服务端仍是空部门（未保存的编辑不落盘）。 */
+    await clearToasts();
+    await clickCanvasAction('cvDisable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.tree && app.tree.enabled === false;
+    }, null, { timeout: 8000 });
+    const preserved = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        departments: (app.tree.departments || []).slice(),
+        savedDepartments: (app.saved && app.saved.departments || []).slice(),
+        kind: app.changeKind,
+        input: document.getElementById('cvDepartments').value,
+        enabled: !!app.tree.enabled
+      };
+    });
+    assert.equal(preserved.enabled, false);
+    assert.deepEqual(preserved.departments, ['财务部'],
+      'a lifecycle call silently discarded unsaved department edits');
+    assert.deepEqual(preserved.savedDepartments, [],
+      'the save baseline claimed departments that were never saved');
+    assert.notEqual(preserved.kind, 'clean', 'the dirty department edit was marked saved by the lifecycle call');
+    assert.equal(preserved.input, '财务部', 'the graph settings input lost the unsaved edit');
+    assert.deepEqual((await serverTree(OTHER)).departments, [],
+      'disabling the graph saved the unsaved departments unexpectedly');
+  } finally {
+    /* 清理：源图部门恢复为空 + 基线（启用/默认）恢复；副本保持停用即可。 */
+    const current = await serverTree(TREE_ID).catch(() => null);
+    if (current && Array.isArray(current.departments) && current.departments.length) {
+      await api('PUT', '/admin/trees/' + TREE_ID + '/departments', {
+        departments: [],
+        base_document_sha256: current.document_sha256
+      });
+    }
+    await ensureBaselineTree();
+  }
 });
 
 await runIfMain(import.meta.url);

@@ -87,8 +87,10 @@ def test_present_record_labels_hydrated_and_live_rows():
         "routing_ms": 4.0, "total_ms": 12.0, "waves": 1,
     })
     assert hydrated["route_label"] == {"zh": "默认目标兜底", "en": "Default target fallback"}
+    # 计算日志只展示路由决策成本：决策耗时 / 决策模型耗时 / 轮次。
     assert [pair[0]["en"] for pair in hydrated["metrics"]] == [
-        "Upstream", "Routing", "Total", "Waves"]
+        "Decision time", "Decision model time", "Waves"]
+    assert hydrated["metrics"][0][1] == "4ms"
     assert [pair[0]["en"] for pair in hydrated["fields"]][:2] == [
         "Request ID", "Decision group"]
 
@@ -303,7 +305,7 @@ def test_present_trace_formats_fallback_and_no_candidate_final():
 
 def test_present_trace_formats_schedule_and_scheduled_values():
     schedule = present_trace([{
-        "event": "schedule", "target_id": "power-target", "strategy": "least_inflight",
+        "event": "schedule", "target_id": "power-target",
         "configured_models": ["qwen3-8b", "qwen3-32b"],
         "registered_models": ["qwen3-8b", "qwen3-32b"],
         "available_models": ["qwen3-8b"],
@@ -312,7 +314,7 @@ def test_present_trace_formats_schedule_and_scheduled_values():
         "sticky": {"status": "miss", "preferred_model": "qwen3-8b"},
     }], has_time_period=False)[0]
     assert schedule["kind_label"] == {"zh": "调度", "en": "Schedule"}
-    assert schedule["summary"]["zh"] == "目标 power-target：1 个可用模型，策略 least_inflight"
+    assert schedule["summary"]["zh"] == "目标 power-target：1 个可用模型"
     assert schedule["facts"][0] == [
         {"zh": "可用模型", "en": "Available models"}, "qwen3-8b"]
     assert schedule["facts"][2] == [{"zh": "在途", "en": "In flight"}, "qwen3-8b: 1"]
@@ -335,3 +337,5 @@ def test_present_result_event_has_outcome_kind_label():
         "upstream_status": 200, "total_ms": 12.0,
     })
     assert outcome["kind_label"] == {"zh": "结果", "en": "Outcome"}
+    # 上游状态与端到端耗时不属于路由决策，不再进入执行结果事实。
+    assert outcome["facts"] == [[{"zh": "模型", "en": "Model"}, "qwen3-8b"]]

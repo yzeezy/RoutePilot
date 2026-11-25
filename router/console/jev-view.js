@@ -1,479 +1,584 @@
-/* RoutePilot console · JEV 模型页视图层（C 方案：只读档案 + 按需编辑）
+/* RoutePilot console · 决策服务目录页视图层（单向 initJevView(actions)）
    ------------------------------------------------------------------
-   本模块由 jev.js 末尾动态 import 进来，页面 HTML 因此只保留一个
-   `<script type="module" src="jev.js">`（scripts/console_qa.mjs 会断言每个
-   控制台页面恰好一个 script 标签）。
+   页面 HTML 只保留一个 `<script type="module" src="jev.js">`（QA 断言每个控制台
+   页面恰好一个 script 标签）。jev.js 静态 import 本模块，并在启动前调用
+   `initJevView({ listServices, createService, updateService, deleteService,
+   testService })`；本模块不 import jev.js —— 依赖单向，没有循环。
 
-   职责（只在展示层，不改 jev.js 的取数/保存/测试逻辑）：
-   - 文件内中英词典与 data-x 文案渲染；
-   - 只读「服务档案」与编辑态的切换、取消还原快照；
-   - 档案数值 / 字符数 / 上下文摘要在每次 jev.js 写入 DOM 后的镜像；
-   - 「本次会话」测试徽章（未测试 / 测试中 / 通过·Nms / 失败）；
-   - 页级「保存全部」的校验前置与配置→上下文的顺序提交，以及 #saveMsg 反馈。
+   职责（只在展示与交互层，不 import 数据层）：
+   - 左侧服务目录列表（按 id 排序）：id / model / base_url / 窗口 / 密钥状态，
+     永不渲染密钥材料；列表语义是 <ul><li><button>（button 不再被 role=listitem
+     覆盖，键盘/读屏仍按按钮语义工作）；
+   - 右侧当前服务编辑器：服务 ID、连接、提示词模板、State 模板、输入/上下文窗口；
+   - 每个服务各自的未保存草稿：切换服务时保存当前草稿、恢复目标草稿；语言切换
+     与连接测试只重绘文案/结果，绝不回填表单值（不覆盖草稿）；
+   - 测试结果 / 原始响应属于“当前服务”：切换、新建、保存后复位，避免把上一个
+     服务的结果显示在新服务上；
+   - 删除的唯一确认机制是共享 impact.js（409 `impact_confirmation_required`）：
+     单击直接发 DELETE，被画布引用的服务由影响框确认后带精确哈希与
+     `replacement_jev_id` 重试，取消不发任何写请求，陈旧哈希只提示重新加载；
+     没有本地的“再次点击确认”二次门。
    ------------------------------------------------------------------ */
-import { LANG, onLangChange } from './i18n.js';
+import { apiErrText } from './api.js';
+import { LANG, onLangChange, t, tf } from './i18n.js';
+import { withImpactConfirmation } from './impact.js';
 
-/* ── copy that is not already in i18n.js ─────────────────────────────── */
-const X = {
-  zh: {
-    'archive.title': '服务档案',
-    'archive.edit': '编辑配置',
-    'archive.cancel': '取消编辑',
-    'archive.hint': '保存后写入服务配置',
-    'file.window': '上下文窗口',
-    'file.windowNote': '输入 / 预算',
-    'file.instructions': '默认指令',
-    'file.template': 'State 模板',
-    'key.present': '已配置',
-    'key.missing': '未配置',
-    'unit.chars': '{n} 字符',
-    'unit.seconds': '{n} 秒',
-    'req.ok': '含 {request}',
-    'req.bad': '缺 {request}',
-    'edit.conn': '连接与鉴权',
-    'edit.prompt': '提示词模板',
-    'edit.window': '上下文长度',
-    'save.saving': '保存中…',
-    'save.all': '保存全部',
-    'save.window': '保存上下文',
-    'save.invalid': '未保存：上下文长度校验未通过',
-    'save.windowFail': '上下文保存失败，请重试',
-    'edit.saveHint': '「保存全部」会同时写入连接、提示词与上下文',
-    'test.custom': '自定义测试文本',
-    'test.label': '测试文本',
-    'test.empty': '尚未测试 · 运行一次以验证服务可达',
-    'test.untested': '未测试',
-    'test.running': '测试中…',
-    'test.pass': '测试通过 · {ms}ms',
-    'test.passBare': '测试通过',
-    'test.fail': '测试失败',
-  },
-  en: {
-    'archive.title': 'Service profile',
-    'archive.edit': 'Edit configuration',
-    'archive.cancel': 'Cancel editing',
-    'archive.hint': 'Saving writes the service config',
-    'file.window': 'Context window',
-    'file.windowNote': 'input / budget',
-    'file.instructions': 'Default instructions',
-    'file.template': 'State template',
-    'key.present': 'Configured',
-    'key.missing': 'Not set',
-    'unit.chars': '{n} chars',
-    'unit.seconds': '{n} s',
-    'req.ok': 'includes {request}',
-    'req.bad': 'missing {request}',
-    'edit.conn': 'Connection & auth',
-    'edit.prompt': 'Prompt templates',
-    'edit.window': 'Context length',
-    'save.saving': 'Saving…',
-    'save.all': 'Save all',
-    'save.window': 'Save context',
-    'save.invalid': 'Not saved: context length check failed',
-    'save.windowFail': 'Context was not saved — please retry',
-    'edit.saveHint': '“Save all” writes connection, prompts and context',
-    'test.custom': 'Custom test text',
-    'test.label': 'Test text',
-    'test.empty': 'Not tested yet · run once to verify the service',
-    'test.untested': 'Not tested',
-    'test.running': 'Testing…',
-    'test.pass': 'Test passed · {ms}ms',
-    'test.passBare': 'Test passed',
-    'test.fail': 'Test failed',
-  },
-};
-const dict = () => X[LANG] || X.zh;
-const tx = key => (dict()[key] ?? X.zh[key] ?? key);
-const fill = (text, vars) => Object.entries(vars).reduce(
-  (out, [k, v]) => out.split('{' + k + '}').join(String(v)), text);
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
 
-const $ = sel => document.querySelector(sel);
-const $$ = sel => [...document.querySelectorAll(sel)];
+/* 与 router/jev/config.py 一致的服务端默认值：新建服务时预填，避免空模板 422。
+   这只是默认文案，保存时仍走服务端校验（instructions 非空、模板含 {request}）。 */
+const DEFAULT_INSTRUCTIONS = '你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。';
+const DEFAULT_STATE_TEMPLATE = '【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。';
+const WINDOW_LIMITS = { minContext: 512, minInput: 256, max: 131072 };
 
-function paintX(lang) {
-  const table = X[lang] || X.zh;
-  $$('[data-x]').forEach(el => {
-    const value = table[el.dataset.x];
-    if (value == null) return;
-    if (el.dataset.xAttr) el.setAttribute(el.dataset.xAttr, value);
-    else el.textContent = value;
-  });
-}
-
-/* ── read-only profile mirrors the live DOM values ───────────────────── */
-const FIELDS = ['baseUrl', 'model', 'apiKey', 'timeout', 'instructions',
-  'stateTemplate', 'winContext', 'winInput'];
-const SAVED_TEXTS = ['已保存', 'Saved'];
-const LOADING_TEXTS = ['加载中…', 'Loading…'];
-const KEY_KEEP = ['留空则保留现有密钥', 'Leave empty to keep the current key'];
-const KEY_EMPTY = ['可选；也可使用 ROUTER_JEV_API_KEY', 'Optional; ROUTER_JEV_API_KEY also works'];
 const TEST_DEFAULT = {
   zh: '请选择一个候选以验证决策服务。',
-  en: 'Pick one of the candidates to verify the decision service.',
+  en: 'Pick one of the candidates to verify the decision service.'
 };
 
-const readPane = $('#readPane');
-const editPane = $('#editPane');
-const editBtn = $('#editConfig');
-const saveMsg = $('#saveMsg');
-const windowMsg = $('#windowMsg');
-const saveJevBtn = $('#saveJev');
-const saveWindowBtn = $('#saveWindow');
-const apiKeyField = $('#apiKey');
-const testOut = $('#testOut');
+let ACTIONS = null;
+let services = [];
+let drafts = new Map();
+let currentId = null;
+let creating = false;
+let saving = false;
+let testing = false;
+let keyPresent = false;
+let lastTest = { state: 'untested', selectedKey: '', ms: null };
 
-let editing = false;
-let snapshot = null;
-
+/* ── DOM helpers ─────────────────────────────────────────────────────── */
 function fieldValue(id) {
   const el = $('#' + id);
   return el ? el.value : '';
 }
-
-/* which placeholder jev.js wrote tells us whether a key is stored */
-function keyState() {
-  const ph = apiKeyField ? apiKeyField.placeholder : '';
-  if (KEY_KEEP.includes(ph)) return 'present';
-  if (KEY_EMPTY.includes(ph)) return 'missing';
-  return 'unknown';
+function setValue(id, value) {
+  const el = $('#' + id);
+  if (el) el.value = value == null ? '' : String(value);
+}
+function checked(id) {
+  const el = $('#' + id);
+  return !!(el && el.checked);
+}
+function setChecked(id, value) {
+  const el = $('#' + id);
+  if (el) el.checked = !!value;
+}
+function focusField(id) {
+  const el = $('#' + id);
+  if (el && el.focus) el.focus({ preventScroll: false });
 }
 
-function refreshProfile() {
-  const url = fieldValue('baseUrl');
-  const model = fieldValue('model');
-  const timeout = parseFloat(fieldValue('timeout'));
-  const instructions = fieldValue('instructions');
-  const template = fieldValue('stateTemplate');
-
-  const roUrl = $('#roBaseUrl');
-  if (roUrl) roUrl.textContent = url || '—';
-  const roModel = $('#roModel');
-  if (roModel) roModel.textContent = model || '—';
-  const roTimeout = $('#roTimeout');
-  if (roTimeout) roTimeout.textContent = Number.isFinite(timeout)
-    ? fill(tx('unit.seconds'), { n: timeout }) : '—';
-
-  const roKey = $('#roKey');
-  if (roKey) {
-    const state = keyState();
-    roKey.textContent = state === 'present' ? tx('key.present')
-      : state === 'missing' ? tx('key.missing') : '—';
-    roKey.className = 'pill' + (state === 'present' ? ' ok' : '');
-  }
-
-  const roInstr = $('#roInstr');
-  if (roInstr) roInstr.textContent = fill(tx('unit.chars'), { n: instructions.length });
-  const roTpl = $('#roTpl');
-  if (roTpl) roTpl.textContent = fill(tx('unit.chars'), { n: template.length });
-  const roReq = $('#roReq');
-  if (roReq) {
-    const ok = template.includes('{request}');
-    roReq.textContent = tx(ok ? 'req.ok' : 'req.bad');
-    roReq.className = 'pill' + (ok ? ' ok' : ' bad');
-  }
-}
-
-/* ── “this session” test badge, read from the real result ───────────── */
-function testState() {
-  if (!testOut) return { kind: 'untested' };
-  if (testOut.querySelector('.out-empty')) return { kind: 'untested' };
-  const card = testOut.querySelector('.card');
-  if (card) {
-    let ms = null;
-    try {
-      const data = JSON.parse(card.querySelector('pre')?.textContent || '');
-      if (typeof data.duration_ms === 'number') ms = Math.round(data.duration_ms);
-    } catch (error) { /* result without JSON => still a pass */ }
-    return { kind: 'pass', ms };
-  }
-  const text = testOut.textContent.trim();
-  if (!text) return { kind: 'untested' };
-  if (LOADING_TEXTS.includes(text)) return { kind: 'running' };
-  return { kind: 'fail' };
-}
-
-function paintTestBadge() {
-  const badge = $('#testBadge');
-  const text = $('#testBadgeText');
-  if (!badge || !text) return;
-  const state = testState();
-  let cls = 'pill';
-  let label = tx('test.untested');
-  if (state.kind === 'running') { cls = 'pill indigo'; label = tx('test.running'); }
-  if (state.kind === 'fail') { cls = 'pill bad'; label = tx('test.fail'); }
-  if (state.kind === 'pass') {
-    cls = 'pill ok';
-    label = state.ms == null ? tx('test.passBare') : fill(tx('test.pass'), { ms: state.ms });
-  }
-  if (badge.className !== cls) badge.className = cls;
-  if (text.textContent !== label) text.textContent = label;
-  const grid = document.querySelector('.jev-grid');
-  if (grid) grid.classList.toggle('has-result', state.kind !== 'untested');
-}
-
-/* ── edit ⇄ read only ───────────────────────────────────────────────── */
-function snapshotValues() {
-  snapshot = {
-    values: FIELDS.map(fieldValue),
-    clearKey: !!($('#clearKey') || {}).checked,
+/* ── draft ⇄ form ────────────────────────────────────────────────────── */
+function readDraft() {
+  return {
+    id: fieldValue('jevServiceId').trim(),
+    baseUrl: fieldValue('jevBaseUrl').trim(),
+    model: fieldValue('jevModel').trim(),
+    keyEnv: fieldValue('jevKeyEnv').trim(),
+    timeoutSeconds: fieldValue('jevTimeout'),
+    instructions: fieldValue('jevInstructions'),
+    stateTemplate: fieldValue('jevStateTemplate'),
+    inputTokens: fieldValue('jevInputTokens'),
+    contextTokens: fieldValue('jevContextTokens'),
+    apiKey: fieldValue('jevApiKey'),
+    clearKey: checked('jevClearKey')
   };
 }
-function restoreValues() {
-  if (!snapshot) return;
-  FIELDS.forEach((id, index) => {
-    const el = $('#' + id);
-    if (el) el.value = snapshot.values[index];
-  });
-  const clear = $('#clearKey');
-  if (clear) clear.checked = snapshot.clearKey;
-  /* re-run jev.js's own window validation (it listens for input) so the
-     canceled state cannot leave a stale red message or disabled button. */
-  ['#winContext', '#winInput'].forEach(sel => {
-    const el = $(sel);
-    if (el) el.dispatchEvent(new Event('input', { bubbles: true }));
-  });
+
+function draftFromService(service) {
+  return {
+    id: service.id || '',
+    baseUrl: service.base_url || '',
+    model: service.model || '',
+    keyEnv: service.key_env || '',
+    timeoutSeconds: service.timeout_seconds == null ? 10 : service.timeout_seconds,
+    instructions: service.instructions || '',
+    stateTemplate: service.state_template || '',
+    inputTokens: service.input_tokens == null ? 1024 : service.input_tokens,
+    contextTokens: service.context_tokens == null ? 4096 : service.context_tokens,
+    apiKey: '',
+    clearKey: false
+  };
 }
 
-function paintEditButton() {
-  if (!editBtn) return;
-  editBtn.dataset.x = editing ? 'archive.cancel' : 'archive.edit';
-  editBtn.textContent = tx(editBtn.dataset.x);
+function fillDraft(draft) {
+  const source = draft || {};
+  setValue('jevServiceId', source.id);
+  setValue('jevBaseUrl', source.baseUrl);
+  setValue('jevModel', source.model);
+  setValue('jevKeyEnv', source.keyEnv);
+  setValue('jevTimeout', source.timeoutSeconds);
+  setValue('jevInstructions', source.instructions);
+  setValue('jevStateTemplate', source.stateTemplate);
+  setValue('jevInputTokens', source.inputTokens);
+  setValue('jevContextTokens', source.contextTokens);
+  /* 密钥输入永远不回填；草稿也不保留密钥。 */
+  setValue('jevApiKey', '');
+  setChecked('jevClearKey', false);
 }
 
-function setEditing(next) {
-  editing = next;
-  if (readPane) readPane.hidden = next;
-  if (editPane) editPane.hidden = !next;
-  paintEditButton();
-  const card = $('#archiveCard');
-  const grid = document.querySelector('.jev-grid');
-  if (card) card.classList.toggle('is-editing', next);
-  if (grid) grid.classList.toggle('is-editing', next);
-  if (editBtn) editBtn.setAttribute('aria-expanded', String(next));
-  if (next) {
-    if (saveMsg) saveMsg.textContent = '';
-    paintFeedback();
-    snapshotValues();
-    const first = $('#baseUrl');
-    if (first) first.focus();
-  } else if (editBtn) {
-    editBtn.focus();
+function blankDraft() {
+  return {
+    id: '', baseUrl: '', model: '', keyEnv: '', timeoutSeconds: 10,
+    instructions: DEFAULT_INSTRUCTIONS, stateTemplate: DEFAULT_STATE_TEMPLATE,
+    inputTokens: 1024, contextTokens: 4096, apiKey: '', clearKey: false
+  };
+}
+
+function storeCurrentDraft() {
+  if (!currentId || creating) return;
+  /* 草稿只保留非密钥字段：用户输入的 api_key 只在写请求那一刻读取，
+     不进入按服务缓存的草稿表，切换/重绘都不可能把它带回来。 */
+  const draft = readDraft();
+  delete draft.apiKey;
+  delete draft.clearKey;
+  drafts.set(currentId, draft);
+}
+
+/* ── window validation (local, before any write) ─────────────────────── */
+function windowProblem(draft) {
+  const context = Number(draft.contextTokens);
+  const input = Number(draft.inputTokens);
+  const { minContext, minInput, max } = WINDOW_LIMITS;
+  if (!Number.isInteger(context) || context < minContext || context > max) {
+    return tf('models.window.badContext', { min: minContext, max });
   }
-  if (!next) refreshProfile();
+  if (!Number.isInteger(input) || input < minInput || input > max) {
+    return tf('models.window.badInput', { min: minInput, max });
+  }
+  if (input > context) return t('models.window.badRelation');
+  return '';
 }
 
-if (editBtn) {
-  editBtn.addEventListener('click', () => {
-    if (!editing) { setEditing(true); return; }
-    restoreValues();
-    setEditing(false);
-    if (saveMsg) saveMsg.textContent = '';
-    paintFeedback();
+/* ── feedback ────────────────────────────────────────────────────────── */
+function showMessage(text, bad) {
+  const msg = $('#jevMsg');
+  if (!msg) return;
+  msg.textContent = text || '';
+  msg.classList.toggle('bad', !!bad);
+  msg.classList.toggle('ok', !bad && !!text);
+}
+
+/* 非影响类错误（404 / 422 / 网络）直接展示服务端 detail；409 影响确认与
+   陈旧哈希由共享 impact.js 组件处理，这里不再重复兜底。 */
+function showActionError(error, fallbackKey) {
+  showMessage(tf(fallbackKey, { err: apiErrText(error) }), true);
+}
+
+function setBusy(busy) {
+  ['#jevNew', '#jevSave', '#jevTest', '#jevDelete'].forEach(selector => {
+    const el = $(selector);
+    if (el) el.disabled = busy;
   });
+  $$('#jevEditor input, #jevEditor textarea').forEach(el => { el.disabled = busy; });
 }
 
-/* Page-level save = "save everything". It validates the context window first
-   (the one client-side validation we have), then submits the config and the
-   window one after another and only reports success when both succeeded.
-   Nothing is submitted when the window is invalid — no silent skip. */
-function waitFor(check, timeout = 6000) {
-  return new Promise(resolve => {
-    const started = Date.now();
-    const timer = setInterval(() => {
-      const result = check();
-      if (result) { clearInterval(timer); resolve(result); return; }
-      if (Date.now() - started > timeout) { clearInterval(timer); resolve(null); }
-    }, 120);
-  });
+/* ── key state (never the key material) ──────────────────────────────── */
+function paintKeyPlaceholder(state) {
+  const input = $('#jevApiKey');
+  if (!input) return;
+  input.placeholder = state ? t('jev.keyKeep') : t('jev.keyEmpty');
+}
+function keyPill(service) {
+  const pill = document.createElement('span');
+  pill.className = 'pill';
+  let key = 'jev.keyNone';
+  if (service.key_present) {
+    key = service.key_source === 'env' ? 'jev.keyFromEnv' : 'jev.keyPresent';
+    pill.classList.add(service.key_source === 'env' ? 'indigo' : 'ok');
+  }
+  pill.textContent = t(key);
+  return pill;
 }
 
-function focusInvalidWindow() {
-  const context = parseInt(fieldValue('winContext'), 10);
-  const input = parseInt(fieldValue('winInput'), 10);
-  const target = Number.isFinite(context) && Number.isFinite(input) && input > context
-    ? $('#winInput') : $('#winContext');
-  const group = $('#windowCard');
-  if (group && group.scrollIntoView) group.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  if (target) target.focus({ preventScroll: true });
-}
-
-function runWindowSave() {
-  return new Promise(resolve => {
-    const presets = $('#winContextPresets');
-    let settled = false;
-    let poll = 0;
-    let timeout = 0;
-    const finish = ok => {
-      if (settled) return;
-      settled = true;
-      observer.disconnect();
-      clearInterval(poll);
-      clearTimeout(timeout);
-      resolve(ok);
-    };
-    const observer = new MutationObserver(() => finish(true)); // jev.js re-renders presets on success
-    if (presets) observer.observe(presets, { childList: true });
-    poll = setInterval(() => {
-      if (windowMsg && windowMsg.textContent.trim()) finish(false);
-    }, 150);
-    timeout = setTimeout(() => finish(false), 6000);
-    awaitingWindowSave = true;
-    if (saveWindowBtn) saveWindowBtn.click();
-  });
-}
-
-let saving = false;
-let bypassSaveClick = false;
-
-async function saveAll() {
-  if (!editing || saving) return;
-  if (!saveJevBtn) return;
-  saving = true;
-
-  /* 1 · context window must be valid before anything is written */
-  if (saveWindowBtn && saveWindowBtn.disabled) {
-    if (saveMsg) saveMsg.textContent = tx('save.invalid');
-    paintFeedback();
-    focusInvalidWindow();
-    saving = false;
+/* ── list rendering ──────────────────────────────────────────────────── */
+function renderList() {
+  const list = $('#jevList');
+  const count = $('#jevCount');
+  if (count) count.textContent = String(services.length);
+  if (!list) return;
+  list.textContent = '';
+  if (!services.length) {
+    const empty = document.createElement('li');
+    empty.className = 'jev-list-empty mut';
+    empty.textContent = t('jev.listEmpty');
+    list.appendChild(empty);
     return;
   }
+  for (const service of services) {
+    /* 列表项是 <li>，可点击主体是 <button>：两者语义分离，不再用
+       role="listitem" 覆盖 button 的角色。 */
+    const row = document.createElement('li');
+    row.className = 'jev-list-row';
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'jev-item' + (service.id === currentId && !creating ? ' is-on' : '');
+    item.dataset.jevServiceId = service.id;
 
-  /* 2 · connection + prompts (this is jev.js's own #saveJev handler) */
-  const previous = saveMsg ? saveMsg.textContent : '';
-  if (saveMsg) saveMsg.textContent = tx('save.saving');
-  paintFeedback();
-  bypassSaveClick = true;
-  saveJevBtn.click();
-  bypassSaveClick = false;
-  const config = await waitFor(() => {
-    const text = (saveMsg ? saveMsg.textContent : '').trim();
-    if (!text || text === tx('save.saving')) return null;
-    return SAVED_TEXTS.includes(text) ? 'ok' : 'error';
+    const head = document.createElement('span');
+    head.className = 'ji-row';
+    const id = document.createElement('span');
+    id.className = 'ji-id';
+    id.textContent = service.id;
+    head.appendChild(id);
+    head.appendChild(keyPill(service));
+    item.appendChild(head);
+
+    const meta = document.createElement('span');
+    meta.className = 'ji-meta';
+    meta.textContent = [service.model, service.base_url].filter(Boolean).join(' · ');
+    item.appendChild(meta);
+
+    const win = document.createElement('span');
+    win.className = 'ji-window';
+    win.textContent = (service.input_tokens == null ? '—' : service.input_tokens) +
+      ' / ' + (service.context_tokens == null ? '—' : service.context_tokens) + ' token';
+    item.appendChild(win);
+
+    item.addEventListener('click', () => selectService(service.id));
+    row.appendChild(item);
+    list.appendChild(row);
+  }
+}
+
+function paintStatus() {
+  const status = $('#jevStatus');
+  if (status) status.textContent = currentId && !creating ? currentId : t('jev.unconfigured');
+  const mode = $('#jevMode');
+  if (mode) mode.textContent = creating ? t('jev.modeNew') : currentId ? t('jev.modeEdit') : '—';
+}
+
+function markSelected() {
+  $$('#jevList [data-jev-service-id]').forEach(item => {
+    item.classList.toggle('is-on', !creating && item.dataset.jevServiceId === currentId);
   });
-  if (config !== 'ok') {
-    saving = false;
-    paintFeedback();
-    return; // jev.js error text stays visible; nothing else is submitted
-  }
-  if (!editing) { saving = false; return; } // canceled while the request was in flight
-
-  /* 3 · context window (its own handler), only after the config landed */
-  const windowOk = await runWindowSave();
-  saving = false;
-  if (!windowOk) {
-    if (saveMsg) saveMsg.textContent = tx('save.windowFail');
-    paintFeedback();
-    return; // stay in edit mode: never report success for a partial save
-  }
-  if (editing) setEditing(false); // success: one “已保存”, back to the profile
-  paintFeedback();
 }
 
-/* Intercept the page-level button in the capture phase so jev.js's own
-   listener only runs once our validation passed (otherwise it would start
-   writing before we can block an invalid context window). */
-const actionsRow = document.querySelector('.edit-actions');
-if (actionsRow && saveJevBtn) {
-  actionsRow.addEventListener('click', event => {
-    const button = event.target.closest && event.target.closest('#saveJev');
-    if (!button || bypassSaveClick) return;
-    event.preventDefault();
-    event.stopPropagation();
-    saveAll();
-  }, true);
+/* ── test result (language-sensitive, never touches the draft) ───────── */
+function paintTestRunning() {
+  lastTest = { state: 'running', selectedKey: '', ms: null };
+  const out = $('#jevTestResult');
+  if (!out) return;
+  out.dataset.state = 'running';
+  out.textContent = t('jev.testRunning');
+  const details = $('#jevTestRawDetails');
+  if (details) { details.hidden = true; details.open = false; }
+  const raw = $('#jevTestRaw');
+  if (raw) raw.textContent = '';
 }
 
-/* canceling after a successful window save must keep the saved numbers */
-let awaitingWindowSave = false;
-if (saveWindowBtn) {
-  saveWindowBtn.addEventListener('click', () => { awaitingWindowSave = true; });
-  const presets = $('#winContextPresets');
-  if (presets) {
-    new MutationObserver(() => {
-      if (!awaitingWindowSave) return;
-      awaitingWindowSave = false;
-      if (editing) {
-        const values = { winContext: fieldValue('winContext'), winInput: fieldValue('winInput') };
-        if (snapshot) FIELDS.forEach((id, index) => {
-          if (id in values) snapshot.values[index] = values[id];
-        });
+function paintTestPass(result) {
+  const data = result || {};
+  const ms = Number.isFinite(Number(data.duration_ms)) ? Math.round(Number(data.duration_ms)) : null;
+  const key = data.selected_key == null ? '—' : String(data.selected_key);
+  lastTest = { state: 'pass', selectedKey: key, ms };
+  const out = $('#jevTestResult');
+  if (!out) return;
+  out.dataset.state = 'pass';
+  out.textContent = ms == null
+    ? tf('jev.testSuccessBare', { key })
+    : tf('jev.testSuccess', { key, ms });
+  const details = $('#jevTestRawDetails');
+  if (details) { details.hidden = false; details.open = false; }
+  const raw = $('#jevTestRaw');
+  if (raw) raw.textContent = JSON.stringify(data, null, 2);
+}
+
+function paintTestFailure(error) {
+  lastTest = { state: 'fail', selectedKey: '', ms: null };
+  const out = $('#jevTestResult');
+  if (!out) return;
+  out.dataset.state = 'fail';
+  out.textContent = tf('jev.msgTestFail', { err: apiErrText(error) });
+  const details = $('#jevTestRawDetails');
+  if (details) { details.hidden = true; details.open = false; }
+  const raw = $('#jevTestRaw');
+  if (raw) raw.textContent = '';
+}
+
+/* Repaint only the parts that are copy, using the stored result metadata. */
+function paintTestStored() {
+  const out = $('#jevTestResult');
+  if (!out) return;
+  if (lastTest.state === 'pass') {
+    out.textContent = lastTest.ms == null
+      ? tf('jev.testSuccessBare', { key: lastTest.selectedKey })
+      : tf('jev.testSuccess', { key: lastTest.selectedKey, ms: lastTest.ms });
+  } else if (lastTest.state === 'running') {
+    out.textContent = t('jev.testRunning');
+  } else if (lastTest.state === 'untested') {
+    out.textContent = t('jev.testEmpty');
+  }
+  /* fail 状态保留服务端错误原文（与语言无关），不做二次翻译。 */
+}
+
+/* 测试结果属于当前服务：切换 / 新建 / 保存后必须复位，绝不能把上一个服务的
+   成功/失败结果或原始响应显示在新服务上。 */
+function resetTestResult() {
+  lastTest = { state: 'untested', selectedKey: '', ms: null };
+  const out = $('#jevTestResult');
+  if (out) {
+    out.dataset.state = 'untested';
+    out.textContent = t('jev.testEmpty');
+  }
+  const details = $('#jevTestRawDetails');
+  if (details) { details.hidden = true; details.open = false; }
+  const raw = $('#jevTestRaw');
+  if (raw) raw.textContent = '';
+}
+
+/* ── selection / new / apply ─────────────────────────────────────────── */
+function selectService(id) {
+  const service = services.find(item => item.id === id);
+  if (!service) return;
+  if (!creating && currentId === id) return;
+  storeCurrentDraft();
+  currentId = id;
+  creating = false;
+  resetTestResult();
+  keyPresent = !!service.key_present;
+  const draft = drafts.get(id) || draftFromService(service);
+  fillDraft(draft);
+  const idInput = $('#jevServiceId');
+  if (idInput) idInput.readOnly = true;
+  paintKeyPlaceholder(keyPresent);
+  paintStatus();
+  markSelected();
+  showMessage('', false);
+}
+
+function newService() {
+  storeCurrentDraft();
+  currentId = null;
+  creating = true;
+  resetTestResult();
+  keyPresent = false;
+  fillDraft(blankDraft());
+  const idInput = $('#jevServiceId');
+  if (idInput) idInput.readOnly = false;
+  paintKeyPlaceholder(false);
+  paintStatus();
+  markSelected();
+  showMessage('', false);
+  focusField('jevServiceId');
+}
+
+function applyService(service) {
+  currentId = service.id;
+  creating = false;
+  /* 保存/应用成功即重置测试结果：配置已变，旧结果不能泄漏到下一次交互。 */
+  resetTestResult();
+  keyPresent = !!service.key_present;
+  const draft = draftFromService(service);
+  drafts.set(service.id, draft);
+  fillDraft(draft);
+  const idInput = $('#jevServiceId');
+  if (idInput) idInput.readOnly = true;
+  paintKeyPlaceholder(keyPresent);
+  renderList();
+  paintStatus();
+  markSelected();
+}
+
+function upsertService(service) {
+  const index = services.findIndex(item => item.id === service.id);
+  if (index >= 0) services[index] = service;
+  else services.push(service);
+  services.sort((left, right) => left.id.localeCompare(right.id));
+}
+
+/* ── actions ─────────────────────────────────────────────────────────── */
+async function saveService() {
+  if (!ACTIONS || saving) return;
+  const draft = readDraft();
+  if (!draft.id) {
+    showMessage(t('jev.msgIdRequired'), true);
+    focusField('jevServiceId');
+    return;
+  }
+  /* 本地先校验窗口，避免一次注定 422 的写请求；创建与编辑同样适用。 */
+  const problem = windowProblem(draft);
+  if (problem) {
+    showMessage(tf('jev.invalidWindow', { err: problem }), true);
+    return;
+  }
+  saving = true;
+  setBusy(true);
+  showMessage('', false);
+  try {
+    if (creating) {
+      const saved = await ACTIONS.createService(draft);
+      upsertService(saved);
+      applyService(saved);
+      showMessage(tf('jev.msgCreated', { id: saved.id }), false);
+    } else if (currentId) {
+      const id = currentId;
+      /* 更新被画布引用的服务：第一次 PUT 只拿 409 影响预览；确认后共享组件
+         用精确哈希重试，取消不产生写请求。数据层回完整响应
+         `{service, synced_trees}`：画布同步数量必须进入成功提示。 */
+      const outcome = await withImpactConfirmation(context =>
+        ACTIONS.updateService(id, draft, context ? context.impact_confirmation : undefined));
+      if (!outcome.ok) {
+        if (outcome.conflict) showMessage(t('impact.conflictToast'), true);
+        return;
       }
-      refreshProfile();
-    }).observe(presets, { childList: true });
+      const payload = outcome.result && typeof outcome.result === 'object' ? outcome.result : {};
+      const saved = payload.service || payload;
+      upsertService(saved);
+      applyService(saved);
+      showSaved(saved.id, payload);
+    } else {
+      showMessage(t('jev.msgPickService'), true);
+    }
+  } catch (error) {
+    showActionError(error, 'jev.msgSaveFail');
+  } finally {
+    saving = false;
+    setBusy(false);
   }
 }
 
-/* save feedback: colour comes from shared .modal-msg.ok/.bad; the card footer
-   note + divider only exist while editing or while a message is showing. */
-const footEl = document.querySelector('.card-foot');
-function paintFeedback() {
-  const text = saveMsg ? saveMsg.textContent.trim() : '';
-  if (saveMsg) {
-    saveMsg.classList.toggle('ok', SAVED_TEXTS.includes(text));
-    saveMsg.classList.toggle('bad',
-      !!text && !SAVED_TEXTS.includes(text) && text !== tx('save.saving'));
-  }
-  if (footEl) footEl.classList.toggle('is-empty', !text);
+/* 服务端同步了哪些画布：已打开的画布不会自动重载，明确提示（与保存/删除文案
+   合并，避免覆盖掉操作本身的反馈）。 */
+function syncedCount(payload) {
+  return payload && Array.isArray(payload.synced_trees) ? payload.synced_trees.length : 0;
 }
-if (saveMsg) {
-  new MutationObserver(paintFeedback)
-    .observe(saveMsg, { childList: true, characterData: true, subtree: true });
+function showSaved(id, payload) {
+  const n = syncedCount(payload);
+  showMessage(n ? tf('jev.msgSavedSynced', { id, n }) : tf('jev.msgSaved', { id }), false);
+}
+function showDeleted(id, payload) {
+  const n = syncedCount(payload);
+  showMessage(n ? tf('jev.msgDeletedSynced', { id, n }) : tf('jev.msgDeleted', { id }), false);
 }
 
-/* ── language-sensitive placeholder / seed text ─────────────────────── */
-function refreshApiKeyPlaceholder() {
-  if (!apiKeyField) return;
-  const ph = apiKeyField.placeholder;
-  let next = null;
-  if (KEY_KEEP.includes(ph)) next = KEY_KEEP;
-  else if (KEY_EMPTY.includes(ph)) next = KEY_EMPTY;
-  if (!next) return;
-  const value = next[LANG === 'en' ? 1 : 0];
-  if (value && apiKeyField.placeholder !== value) apiKeyField.placeholder = value;
+async function runTest() {
+  if (!ACTIONS || saving || testing) return;
+  if (creating || !currentId) {
+    showMessage(t('jev.msgUnsavedTest'), true);
+    return;
+  }
+  /* 测试可能跑满 120s：结果只属于发起测试的那个服务。测试期间用户允许切换
+     服务（列表按钮不禁用），完成时若当前服务已不是它，就丢弃这次结果并复位
+     展示状态，绝不能把结果画到另一个服务上。 */
+  const testedId = currentId;
+  testing = true;
+  setBusy(true);
+  showMessage('', false);
+  paintTestRunning();
+  const stillSelected = () => !creating && currentId === testedId;
+  try {
+    const result = await ACTIONS.testService(testedId, fieldValue('jevTestText'));
+    if (stillSelected()) paintTestPass(result);
+    else resetTestResult();
+  } catch (error) {
+    if (stillSelected()) paintTestFailure(error);
+    else resetTestResult();
+  } finally {
+    testing = false;
+    setBusy(false);
+  }
 }
-if (apiKeyField) {
-  new MutationObserver(refreshApiKeyPlaceholder)
-    .observe(apiKeyField, { attributes: true, attributeFilter: ['placeholder'] });
+
+async function deleteService() {
+  if (!ACTIONS || saving) return;
+  if (creating || !currentId) {
+    showMessage(t('jev.msgPickService'), true);
+    return;
+  }
+  const deletedId = currentId;
+  saving = true;
+  setBusy(true);
+  try {
+    /* 单击即发 DELETE：未被画布引用的服务直接删除；被引用的服务第一次 DELETE
+       只拿 409 影响预览，共享影响框是唯一确认机制，确认时必须选择替代服务
+       （replacement_jev_id），取消则不写任何东西。 */
+    const outcome = await withImpactConfirmation(context => ACTIONS.deleteService(
+      deletedId,
+      context ? {
+        replacement_jev_id: context.replacement_id,
+        impact_confirmation: context.impact_confirmation,
+      } : undefined), { operation: 'delete' });
+    if (!outcome.ok) {
+      if (outcome.conflict) showMessage(t('impact.conflictToast'), true);
+      else showMessage('', false);
+      return;
+    }
+    drafts.delete(deletedId);
+    services = services.filter(service => service.id !== deletedId);
+    currentId = null;
+    creating = false;
+    renderList();
+    if (services.length) selectService(services[0].id);
+    else newService();
+    showDeleted(deletedId, outcome.result);
+  } catch (error) {
+    showActionError(error, 'jev.msgDeleteFail');
+  } finally {
+    saving = false;
+    setBusy(false);
+  }
+}
+
+/* ── language-sensitive copy ─────────────────────────────────────────── */
+function paintTitle() {
+  const title = 'RoutePilot · ' + t('jev.title');
+  if (document.title !== title) document.title = title;
 }
 
 function paintTestDefault() {
-  const el = $('#testText');
+  const el = $('#jevTestText');
   if (!el) return;
-  if (el.value === TEST_DEFAULT.zh || el.value === TEST_DEFAULT.en) {
+  const value = el.value.trim();
+  if (value === '' || value === TEST_DEFAULT.zh || value === TEST_DEFAULT.en) {
     el.value = TEST_DEFAULT[LANG] || TEST_DEFAULT.zh;
   }
 }
 
-/* ── wiring ─────────────────────────────────────────────────────────── */
-if (testOut) {
-  new MutationObserver(() => {
-    paintTestBadge();
-    paintTestDefault();
-  }).observe(testOut, { childList: true, subtree: true, characterData: true });
+function scrollToEditor() {
+  const card = $('#jevEditor');
+  if (card && card.scrollIntoView) card.scrollIntoView({ block: 'start', behavior: 'smooth' });
 }
 
-/* jev.js writes field values asynchronously (boot, save, window save); a light
-   poll keeps the profile honest without touching any of its logic. */
-setInterval(() => {
-  paintFeedback();
-  if (editing) return;
-  refreshProfile();
-  refreshApiKeyPlaceholder();
-}, 700);
+/* ── wiring ──────────────────────────────────────────────────────────── */
+export function initJevView(actions) {
+  ACTIONS = actions;
+  const save = $('#jevSave');
+  if (save) save.addEventListener('click', () => { saveService(); });
+  const test = $('#jevTest');
+  if (test) test.addEventListener('click', () => { runTest(); });
+  const remove = $('#jevDelete');
+  if (remove) remove.addEventListener('click', () => { deleteService(); });
+  const create = $('#jevNew');
+  if (create) create.addEventListener('click', () => { newService(); scrollToEditor(); });
+  boot();
+}
 
-paintX(LANG);
-refreshProfile();
-paintFeedback();
-paintTestBadge();
-paintTestDefault();
-refreshApiKeyPlaceholder();
-
-onLangChange(lang => {
-  paintX(lang);
-  paintEditButton();
-  refreshProfile();
-  paintTestBadge();
+async function boot() {
+  paintTitle();
   paintTestDefault();
-  refreshApiKeyPlaceholder();
+  paintTestStored();
+  try {
+    services = (await ACTIONS.listServices()).slice().sort((left, right) => left.id.localeCompare(right.id));
+  } catch (error) {
+    renderList();
+    paintStatus();
+    showMessage(tf('jev.msgLoadFail', { err: apiErrText(error) }), true);
+    return;
+  }
+  renderList();
+  if (services.length) selectService(services[0].id);
+  else newService();
+}
+
+onLangChange(() => {
+  paintTitle();
+  paintTestDefault();
+  paintKeyPlaceholder(keyPresent);
+  renderList();
+  paintStatus();
+  paintTestStored();
+  /* #jevMsg 里存的是已翻译好的句子：切换语言后清空，避免中英混排。 */
+  showMessage('', false);
 });

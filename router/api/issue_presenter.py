@@ -36,12 +36,12 @@ def present_issue(issue: Issue) -> dict[str, str]:
         detail = _param(issue, "detail")
         if detail:
             return _text(
-                f"图解析失败：root 不符合 sr-routing-graph v3 结构（{detail}）",
-                f"Graph parse failed: root does not conform to the sr-routing-graph v3 structure ({detail})",
+                f"图解析失败：root 不符合 sr-routing-graph v4 结构（{detail}）",
+                f"Graph parse failed: root does not conform to the sr-routing-graph v4 structure ({detail})",
             )
         return _text(
-            "图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）",
-            "Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)",
+            "图解析失败：root 不符合 sr-routing-graph v4 结构（未知字段或类型非法）",
+            "Graph parse failed: root does not conform to the sr-routing-graph v4 structure (unknown fields or invalid types)",
         )
     if code == "invalid_timezone":
         timezone = _param(issue, "timezone")
@@ -222,15 +222,43 @@ def present_issue(issue: Issue) -> dict[str, str]:
             "图包含问题节点，但决策服务（JEV）未配置或不可用",
             "The graph contains question nodes but the decision service (JEV) is not configured or unavailable",
         )
+    if code == "runtime_mismatch":
+        # 只给定位，不把画布/目录值拼进文案：值可能很长（instructions/state_template），
+        # 详细值由 params 交给控制台按字段展示（敏感字段在 consistency 侧已过滤）。
+        kind = {"provider": "provider", "model": "model", "jev": "JEV"}.get(
+            _param(issue, "resource_kind"), _param(issue, "resource_kind"))
+        resource_id = _param(issue, "resource_id")
+        field = _param(issue, "field")
+        return _text(
+            f"画布与数据库目录不一致：{kind} {resource_id} 的 {field}（仅提示，不阻断执行）",
+            f"Canvas and database catalog differ: {kind} {resource_id} field {field} (hint only, execution unaffected)",
+        )
+    if code == "department_conflict":
+        # 跨启用图的部门唯一性冲突：部门名与涉事图 id 都是控制台定位所需。
+        department = _param(issue, "department")
+        tree_ids = list(_param(issue, "tree_ids") or ())
+        joined_zh = "、".join(str(item) for item in tree_ids)
+        joined_en = ", ".join(str(item) for item in tree_ids)
+        return _text(
+            f"部门冲突：{department} 已归属于其他启用图（{joined_zh}）",
+            f"Department conflict: {department} already belongs to another enabled graph ({joined_en})",
+        )
+    if code == "no_default_tree":
+        return _text(
+            "启用集合缺少默认图：有启用图时必须恰好一张默认图",
+            "No default tree: exactly one default graph is required while graphs are enabled",
+        )
     # Defensive: an unmapped code must still render deterministically.
     return _text(code, code)
 
 
 def issues_payload(issues) -> list[dict]:
-    """Issue 列表 → spec §5 的 422 载荷（dict of 双语字段 + 机器定位）。
+    """Issue 列表 → spec §5 的 422/警告载荷（dict of 双语字段 + 机器定位 + params）。
 
-    Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成，
-    控制台收到的键集合与重构前一致。
+    Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成。
+    除既有的 code/zh/en/node_id/edge_id/port/level 外，``params`` 原样透出给
+    控制台（如 ``runtime_mismatch`` 的 resource_kind/resource_id/field 与
+    canvas/database 两侧值）；敏感字段已在 consistency 侧过滤，呈现层不再改写。
     """
     payload = []
     for issue in issues:
@@ -243,5 +271,6 @@ def issues_payload(issues) -> list[dict]:
             "edge_id": issue.edge_id,
             "port": issue.port,
             "level": issue.level,
+            "params": dict(issue.params or {}),
         })
     return payload

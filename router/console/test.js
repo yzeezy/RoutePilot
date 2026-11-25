@@ -1,8 +1,8 @@
 /* RoutePilot · 模型测试对话页（计划 Task 5–8，修订版）
    ------------------------------------------------------------------
-   Task 5（壳）：模型目录选择器、Auto / 固定模型状态、空目录提示
-   （#testModelEmpty + 模型页链接）、内联会话错误（#testError）、
-   角色门控（renderAccessState）、新建对话、语言重绘。
+   Task 5（壳）：Auto 状态行（页面只走智能路由，不提供模型选择）、
+   内联会话错误（#testError）、角色门控（renderAccessState）、新建对话、
+   语言重绘。
    Task 6（附件）：选择 / 拖拽 / 粘贴同一管线；预检在读取之前按
    estimateAttachmentBytes 拒绝预估超限；文本文件只读 file.text()，
    非文本走 Data URL；单文件失败就地内联「文件名: 错误」。
@@ -20,7 +20,7 @@
 import { api, apiErrText, esc, toast } from './api.js';
 import { onLangChange, t } from './i18n.js';
 import {
-  MAX_REQUEST_BYTES, appendMessageDelta, attachmentPart, estimateAttachmentBytes,
+  MAX_REQUEST_BYTES, appendMessageDelta, attachmentPart, chatHeaders, estimateAttachmentBytes,
   historyMessages, isTextFile, normalizeMessage, requestBytes,
 } from './chat/protocol.js';
 import { createSseParser } from './chat/stream.js';
@@ -42,63 +42,54 @@ function newId() {
 }
 
 const state = {
-  model: 'auto', models: [], messages: [], attachments: [],
+  messages: [], attachments: [],
   controller: null, conversationId: 0, sessionId: newId(), role: null,
   activeTree: '', bootError: '', uploadEpoch: 0,
+  /* 测试对话的可信部门 Header（Task 9）：只影响 /admin/test/chat/completions 的
+     选图，绝不进入 OpenAI 请求体；每次发送前从 #testDepartment 读取并 trim。 */
+  department: '',
 };
 /* 发送 / 停止 / 复制 / 重试 / 重新生成与提示文案键，统一从这里取。 */
 const COPY = Object.freeze({
   send: 'test.send', stop: 'test.stop', copy: 'test.copy', retry: 'test.retry',
-  regenerate: 'test.regenerate', direct: 'test.direct', uploadFail: 'test.uploadFail',
+  regenerate: 'test.regenerate', uploadFail: 'test.uploadFail',
   tooLarge: 'test.tooLarge', adminOnly: 'test.adminOnly', incomplete: 'test.incomplete',
   stopped: 'test.stopped',
 });
 const $ = selector => document.querySelector(selector);
 const CHAT_ENDPOINT = '/admin/test/chat/completions';
+/* 输入区锁定/清空的唯一控件清单：textarea、可信部门 Header 输入、附件与文件入口。 */
+const COMPOSER_CONTROLS = ['#testInput', '#testDepartment', '#testAttach', '#testFileInput'];
+/* 页面只演示线上智能路由：请求模型恒为 auto，不给用户旁路决策图的机会。 */
+const CHAT_MODEL = 'auto';
 
-/* ── 模型目录：Auto + 按提供方分组的已配置模型 ──
-   Auto 永远保留；目录为空时把 #testModelEmpty（含 models.html 链接）亮出，
-   不再把链接塞进状态行（计划 Task 5 的 DOM 拆分）。 */
-function renderModelOptions() {
-  const groups = new Map();
-  state.models.forEach(model => {
-    const provider = model.provider || '';
-    if (!groups.has(provider)) groups.set(provider, []);
-    groups.get(provider).push(model);
-  });
-  $('#testModel').innerHTML = `<option value="auto">${esc(t('test.auto'))}</option>` +
-    Array.from(groups, ([provider, models]) => `<optgroup label="${esc(provider)}">${models.map(model =>
-      `<option value="${esc(model.id)}">${esc(model.id)} · ${esc(model.upstream)}</option>`).join('')}</optgroup>`).join('');
-  $('#testModel').value = state.model;
-  /* R-T5 评审回补 c：boot 失败时目录状态未知，空模型提示不得亮出
-     （语言重绘会走这里，之前会在 bootError 下误显示）。 */
-  $('#testModelEmpty').hidden = Boolean(state.bootError) || state.models.length > 0;
-}
-
-/* ── Auto / 固定模型状态：Auto 附上当前启用的决策组名 ── */
+/* ── Auto 状态行：附带默认图名（公开 /v1 使用的那张） ── */
 function renderStatus() {
   const status = $('#testStatus');
   status.replaceChildren();
   if (state.bootError) { status.textContent = state.bootError; return; }
   if (state.role !== null && state.role !== 'admin') { status.textContent = t(COPY.adminOnly); return; }
-  status.textContent = state.model === 'auto'
-    ? t('test.autoStatus') + (state.activeTree ? ` · ${state.activeTree}` : '')
-    : t('test.directStatus');
+  status.textContent = t('test.autoStatus') + (state.activeTree ? ` · ${state.activeTree}` : '');
 }
 
 /* ── 角色门控（计划 Task 5 独立成函数）：非管理员锁死整个输入区 ──
    * 未知角色按只读处理（fail closed）；
-   * 启动失败同样锁死输入区/附件/选择器；
+   * 启动失败同样锁死输入区/附件；
    * updateSendState 只负责在途/内容驱动的发送按钮状态。 */
 function renderAccessState() {
   const admin = state.role === 'admin';
   const locked = Boolean(state.bootError) || !admin;
-  ['#testInput', '#testAttach', '#testFileInput'].forEach(selector => {
+  COMPOSER_CONTROLS.forEach(selector => {
     const element = $(selector);
     if (element) element.disabled = locked;
   });
-  const modelSelect = $('#testModel');
-  if (modelSelect) modelSelect.disabled = Boolean(state.bootError);
+  /* 角色门控同时清掉可信部门：viewer / 启动失败时既不能发送也不能留下会误导
+     下一次发送的部门状态。busy 锁只禁用、不清除（发送期间值属于在途请求）。 */
+  if (locked) {
+    const department = $('#testDepartment');
+    if (department) department.value = '';
+    state.department = '';
+  }
   const input = $('#testInput');
   if (state.bootError) input.placeholder = t('test.placeholder');
   else if (state.role !== null && !admin) input.placeholder = t(COPY.adminOnly);
@@ -130,7 +121,7 @@ function hasComposerContent() {
 function updateSendState() {
   const busy = Boolean(state.controller);
   if (busy) {
-    ['#testInput', '#testAttach', '#testFileInput'].forEach(selector => {
+    COMPOSER_CONTROLS.forEach(selector => {
       const element = $(selector);
       if (element) element.disabled = true;
     });
@@ -187,7 +178,7 @@ async function addFiles(files) {
   for (const file of Array.from(files || [])) {
     const estimatedBytes = estimateAttachmentBytes(file);
     const historyBytes = requestBytes({
-      model: state.model,
+      model: CHAT_MODEL,
       messages: historyMessages(state.messages),
       stream: true,
     });
@@ -337,9 +328,8 @@ function appendAssistantView(message) {
 
 function renderAssistant(message) {
   if (!message.view) return;
-  const model = message.actualModel || message.requestedModel;
-  message.view.querySelector('.tc-message-meta').textContent =
-    message.requestedModel === 'auto' ? `Auto → ${model}` : `${model} · ${t(COPY.direct)}`;
+  const model = message.actualModel || CHAT_MODEL;
+  message.view.querySelector('.tc-message-meta').textContent = `Auto → ${model}`;
   renderParts(message.view.querySelector('.tc-bubble'), message.parts || []);
   const actions = message.view.querySelector('.tc-message-actions');
   actions.replaceChildren();
@@ -425,7 +415,7 @@ function renderConversation() {
    * 发送开始先清掉上一轮的 #testError（R-T5 评审回补 b）。 */
 async function requestAssistant() {
   const body = {
-    model: state.model,
+    model: CHAT_MODEL,
     messages: historyMessages(state.messages),
     stream: true,
   };
@@ -439,7 +429,7 @@ async function requestAssistant() {
     id: newId(), role: 'assistant',
     raw: { role: 'assistant', content: '' },
     parts: [], status: 'streaming',
-    requestedModel: state.model, actualModel: '', selection: '', error: '', view: null,
+    actualModel: '', error: '', view: null,
   };
   /* 发送真正开始：清掉上一轮遗留的内联错误（体积/流错误不跨轮存活）。 */
   hideConversationError();
@@ -452,11 +442,11 @@ async function requestAssistant() {
   try {
     const response = await api.stream(CHAT_ENDPOINT, body, {
       signal: controller.signal,
-      headers: { 'x-sr-session-id': state.sessionId },
+      /* 部门是管理端可信 Header：百分号编码后随请求发送，绝不进入 body。 */
+      headers: chatHeaders({ sessionId: state.sessionId, department: state.department }),
     });
     if (!isCurrent()) return;
-    assistant.actualModel = response.headers.get('x-sr-model') || assistant.requestedModel;
-    assistant.selection = response.headers.get('x-sr-selection') || '';
+    assistant.actualModel = response.headers.get('x-sr-model') || CHAT_MODEL;
     if ((response.headers.get('content-type') || '').includes('text/event-stream') && response.body) {
       reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -528,6 +518,8 @@ function regenerateLast() {
 async function sendCurrent() {
   /* 同时最多一个在途请求；viewer/未知角色 fail closed。 */
   if (state.controller || state.role !== 'admin') return;
+  /* 发送前读取可信部门（Task 9）：它只影响服务端按部门选图，与对话内容无关。 */
+  state.department = ($('#testDepartment').value || '').trim();
   const input = $('#testInput');
   const text = input.value;
   if (!text.trim() && !state.attachments.length) return;
@@ -536,7 +528,7 @@ async function sendCurrent() {
     id: newId(), role: 'user', content, parts: normalizeMessage({ content }), view: null,
   };
   const candidateBody = {
-    model: state.model,
+    model: CHAT_MODEL,
     messages: historyMessages(state.messages.concat(user)),
     stream: true,
   };
@@ -571,7 +563,10 @@ function newChat() {
   clearAttachments();
   clearMessages();
   state.sessionId = newId();
+  state.department = '';
   $('#testInput').value = '';
+  const department = $('#testDepartment');
+  if (department) department.value = '';
   $('#testFileInput').value = '';
   autoResize();
   updateSendState();
@@ -579,10 +574,6 @@ function newChat() {
 }
 
 /* ── 事件绑定 ── */
-$('#testModel').addEventListener('change', event => {
-  state.model = event.target.value;
-  renderStatus();
-});
 $('#testNew').addEventListener('click', newChat);
 document.querySelectorAll('.tc-sample').forEach(button => {
   button.addEventListener('click', () => {
@@ -651,15 +642,13 @@ panel.addEventListener('drop', event => {
 });
 
 async function boot() {
-  const [models, me, trees] = await Promise.all([
-    api.get('/admin/models'), api.me(), api.get('/admin/trees'),
-  ]);
-  state.models = models.models || [];
+  const [me, trees] = await Promise.all([api.me(), api.get('/admin/trees')]);
   /* 未知角色 fail closed：只有明确的 admin 才能发测试请求。 */
   state.role = me.role || 'viewer';
-  const active = (trees.trees || []).find(tree => tree.enabled);
-  state.activeTree = active ? (active.name || active.id) : '';
-  renderModelOptions();
+  /* 状态行展示默认图（公开 /v1 使用的那张），而不是列表里第一张启用的图：
+     多图同时启用时顺序不代表默认关系（Task 8）。 */
+  const preferred = (trees.trees || []).find(tree => tree.default);
+  state.activeTree = preferred ? (preferred.name || preferred.id) : '';
   renderAccessState();
   renderStatus();
   updateSendState();
@@ -667,7 +656,6 @@ async function boot() {
 }
 
 onLangChange(() => {
-  renderModelOptions();
   renderStatus();
   renderAccessState();
   renderAttachments();
@@ -680,7 +668,7 @@ renderAccessState();
 updateSendState();
 autoResize();
 boot().catch(error => {
-  /* 启动失败：原始错误留在状态行，同时锁死输入区/附件/选择器，页面不装活。 */
+  /* 启动失败：原始错误留在状态行，同时锁死输入区/附件，页面不装活。 */
   state.bootError = apiErrText(error);
   state.role = null;
   renderStatus();

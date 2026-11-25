@@ -7,8 +7,9 @@
    · 不直接改 DOM：渲染/提示通过 hooks 回调交给 app.js。
    ------------------------------------------------------------------ */
 import { api, apiErrText } from '../api.js';
-import { t, tf } from '../i18n.js';
+import { LANG, t, tf } from '../i18n.js';
 import * as RTGraph from './graph.js';
+import { createRuntime } from './runtime.js';
 
 function serverIssues(error) {
   const detail = error && error.detail;
@@ -17,6 +18,22 @@ function serverIssues(error) {
     .filter(item => item && typeof item === 'object' && !Array.isArray(item))
     .map(item => Object.assign({ level: 'hard' }, item));
   return issues.length ? issues : null;
+}
+
+/* 导入失败的具体原因：解析/运行配置契约错误没有节点位置，toast 只报
+   「N 个校验问题」会把真正的原因（缺字段、runtime:null、未知字段…）藏起来。
+   优先取首条 graph_parse_error（或首条硬 Issue）的 zh/en，其次退回 parse 结果
+   的 error 文案；都为空时返回空串，由调用方兜底。 */
+function importFailureReason(result, hard) {
+  const localized = issue => {
+    if (!issue) return '';
+    if (LANG === 'en') return issue.en || issue.zh || '';
+    return issue.zh || issue.en || '';
+  };
+  const parseIssue = hard.find(issue => issue && issue.code === 'graph_parse_error');
+  const first = parseIssue || hard[0] || null;
+  const reason = localized(first) || (result && result.error) || '';
+  return String(reason).trim();
 }
 
 function newTreeId() {
@@ -30,17 +47,24 @@ function newTreeId() {
   return raw.replace(/[^a-z0-9]/gi, '').slice(0, 12);
 }
 
-/* 服务端树 / 本地新草稿统一补齐 envelope 字段与缺失坐标。 */
+/* 服务端树 / 本地新草稿统一补齐 envelope 字段与缺失坐标。
+   严格契约：envelope 必须携带完整四字段运行快照（API envelope 里是扁平四字段），
+   缺失即拒绝加载，不再有「无 runtime 草稿」分支。 */
 function normaliseTree(raw) {
   const source = raw || {};
   /* API envelope 的坐标在顶层 canvas：先分发回内部 node.position 再做布局补位。 */
   const tree = RTGraph.dispatchCanvas(RTGraph.clone(source));
   delete tree.canvas;
   /* 运行配置在内部树里统一成嵌套 runtime：Python tree_to_dict 的四字段是扁平的，
-     先投影成契约形状再剔除顶层键；旧文档（无 runtime）显式置 null。 */
+     先投影成契约形状再剔除顶层键。 */
   const runtime = RTGraph.runtimeDocumentView(source);
+  if (!runtime) throw new Error('tree envelope is missing the four runtime fields');
   RTGraph.RUNTIME_FIELDS.forEach(field => { delete tree[field]; });
   tree.runtime = runtime;
+  /* v4 envelope：部门规范化（重复/空部门/控制字符在这里就拒绝），并保留服务端
+     返回的 default（生命周期由启停端点维护，普通保存不写）。 */
+  tree.departments = RTGraph.normalizeDepartments(tree.departments);
+  tree.default = source.default === true;
   tree.root = tree.root || { id: 'root', type: 'graph', nodes: [], edges: [] };
   if (!tree.name) tree.name = t('cv.default.name');
   if (!tree.timezone) tree.timezone = 'Asia/Shanghai';
@@ -68,7 +92,7 @@ export class RoutingController {
        isInspectorEditing() -> boolean
        fitAfterReplace()
        renderTreeSelect()
-       getModels() -> []                                        */
+       getCatalog() -> {providers, models, services, periods}    */
   constructor(options) {
     const opts = options || {};
     this.store = opts.store;
@@ -110,15 +134,25 @@ export class RoutingController {
     this.hooks.renderIssues();
   }
 
-  defaultModelId() {
-    const models = (this.hooks.getModels && this.hooks.getModels()) || [];
-    if (models.length) return models[0].id;
-    return 'qwen3-8b';
+  /* 新建与启动兜底共用：前端 UUID 切片 id，保存时 POST 成新组。
+     新画布的初始运行快照必须从当前数据库目录（createRuntime）生成；目录为空或
+     缺少 provider 时抛明确错误，由 app.js 提示并阻止新建（不再造空 runtime）。 */
+  catalogNow() {
+    return (this.hooks.getCatalog && this.hooks.getCatalog()) || null;
   }
 
-  /* 新建与启动兜底共用：前端 UUID 切片 id，保存时 POST 成新组。 */
   newDraftTree() {
-    const tree = RTGraph.createMinimalTree(this.defaultModelId());
+    const catalog = this.catalogNow();
+    const models = catalog && Array.isArray(catalog.models) ? catalog.models : [];
+    if (!models.length) {
+      throw new Error(t('cv.toastCatalogEmpty'));
+    }
+    const services = catalog && Array.isArray(catalog.services) ? catalog.services : [];
+    const runtime = createRuntime(catalog, {
+      modelId: models[0].id,
+      jevId: services.length ? services[0].id : null
+    });
+    const tree = RTGraph.createMinimalTree(runtime.backends.models[0].id, runtime);
     tree.id = newTreeId();
     tree.name = t('cv.default.name');
     return tree;
@@ -126,7 +160,7 @@ export class RoutingController {
 
   loadTree(raw, saved) {
     /* 真正换树（新建/启动兜底/selectTree 成功）时让在途的 selectTree 回包过期。
-       示例与导入不走这里，它们在应用前各自 bump（见 loadExample / applyImport）。 */
+       示例已移除；导入不走这里，它在应用前自己 bump loadSeq（见 applyImport）。 */
     this.loadSeq += 1;
     const tree = normaliseTree(raw);
     this.treeId = raw && raw.id ? raw.id : newTreeId();
@@ -145,11 +179,13 @@ export class RoutingController {
     if (savedTree.name != null) tree.name = savedTree.name; /* 服务端会 trim 名称 */
     tree.id = savedTree.id || this.treeId;
     tree.enabled = !!savedTree.enabled;
+    tree.default = !!savedTree.default;
+    tree.departments = RTGraph.normalizeDepartments(savedTree.departments);
     tree.tree_revision = savedTree.tree_revision || '';
     tree.updated_at = savedTree.updated_at || '';
     tree.document_sha256 = savedTree.document_sha256 || '';
-    /* 服务端保存时物化的运行配置就是新基线：不同步回当前草稿的话，
-       刚保存的旧草稿（无 runtime）会立刻被判成 behavior dirty。 */
+    /* 服务端回包的完整运行快照就是新基线：不同步回当前草稿的话，
+       保存后的草稿会立刻被判成 behavior dirty。 */
     tree.runtime = RTGraph.runtimeDocumentView(savedTree);
     this.treeId = tree.id;
     /* 回包是保存基线：坐标同样在顶层 canvas，先分发回内部 position 再入基线，
@@ -163,10 +199,49 @@ export class RoutingController {
     return savedTree;
   }
 
+  /* 生命周期回包刷新当前草稿与保存基线（Task 8）：v4 的 enabled/default 不参与
+     behavior canonical，启停/设默认也不会改变 tree_revision；它们只改写目标文档
+     字节，因此 document_sha256 与 updated_at 会变。不同步回保存基线，下一次
+     普通保存会拿旧 base_document_sha256 被 409 graph_conflict 拒绝。
+     多图语义必须逐字段取服务端值：第一张启用图自动默认，之后启用的图是
+     enabled && !default —— 绝不能写 `default = enabled`。
+
+     departments 例外（Task 9）：启停端点从不修改部门，服务端回包里的 departments
+     只是「上一次保存的基线」。草稿有未保存的部门编辑时（dirtyKind !== 'clean'）
+     把它同步回草稿会静默丢弃用户的部门输入。因此这里只在草稿干净时同步
+     departments；脏草稿保留本地编辑，saved 基线也保持原值，下一次保存会带着
+     本地部门一起提交（enable/setDefault 已经先保存脏草稿，走到这里时通常是 clean）。 */
+  syncLifecycleBaseline(updated) {
+    const tree = this.store.tree;
+    if (!tree || !updated) return;
+    const keepDirtyDepartments = this.store.dirtyKind !== 'clean';
+    for (const field of ['enabled', 'default', 'tree_revision', 'updated_at',
+      'document_sha256', 'departments']) {
+      if (field === 'departments' && keepDirtyDepartments) continue;
+      const value = field === 'enabled' || field === 'default'
+        ? updated[field] === true
+        : field === 'departments'
+          ? RTGraph.normalizeDepartments(updated.departments)
+          : (updated[field] || '');
+      tree[field] = RTGraph.clone(value);
+      if (this.store.saved) this.store.saved[field] = RTGraph.clone(value);
+    }
+  }
+
   /* 保存 payload 只含完整 envelope 字段：不发送 enabled / tree_revision / updated_at。 */
   async save() {
     const store = this.store;
     if (!store.tree || store.saving || store.tryRunning) return false;
+    /* 保存前本地硬校验运行配置：四字段缺失/非法一律拒绝（服务端同样 422），
+       不再发送 runtime:null 让服务端从数据库补齐。 */
+    const runtimeIssues = RTGraph.validateRuntime(store.tree)
+      .filter(issue => issue.level !== 'hint');
+    if (runtimeIssues.length) {
+      this.hooks.setIssues(this.mergeIssues(runtimeIssues));
+      this.hooks.revealIssues();
+      this.hooks.toast(tf('cv.toastSaveIssues', { n: runtimeIssues.length }), 'error');
+      return false;
+    }
     store.setSaving(true);
     this.hooks.syncSaving();
     /* 请求发出前记住目标草稿：若期间草稿被切走，回包必须整份丢弃，
@@ -175,20 +250,16 @@ export class RoutingController {
     const targetId = this.treeId;
     const isNew = !store.saved;
     /* 线上 payload 与文件文档同一格式：坐标在顶层 canvas，节点对象不带 position；
-       自包含运行配置按四字段平铺（旧草稿没有 runtime 时发送 runtime:null，由服务端
-       清除当前图继承后按活动图/数据库物化）。 */
+       自包含运行配置按四字段无条件平铺（jev 可为 null，但字段恒在）。 */
     const payload = RTGraph.collectCanvas(RTGraph.clone({
       id: this.treeId,
       name: String(store.tree.name == null ? '' : store.tree.name).trim(),
+      departments: RTGraph.normalizeDepartments(store.tree.departments),
       timezone: store.tree.timezone || 'Asia/Shanghai',
       sticky: RTGraph.clone(store.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
       root: store.tree.root,
     }));
-    /* 旧草稿没有 runtime：显式发送 null，让服务端丢弃“当前图继承”再按活动图/
-       数据库物化；省略该键会继承该图自己的旧配置。 */
-    const runtime = RTGraph.runtimeDocumentView(store.tree);
-    if (runtime) Object.assign(payload, runtime);
-    else payload.runtime = null;
+    Object.assign(payload, RTGraph.runtimeDocumentView(store.tree));
     if (!isNew) payload.base_document_sha256 = store.saved.document_sha256 || '';
     try {
       const result = isNew
@@ -240,10 +311,24 @@ export class RoutingController {
     return this.setEnabled(true);
   }
 
+  /* 默认图停用保护（设计 §6.2/§8）：默认图仍需保留其它启用图时必须先切换默认图。
+     this.trees 来自 GET /admin/trees 与生命周期回包；不在前端猜测，而是拦下一次
+     注定被服务端以 409 default_graph_required 拒绝的写请求。 */
+  hasOtherEnabledTree(treeId) {
+    const target = treeId || this.treeId;
+    return (this.trees || []).some(tree =>
+      !!tree && tree.enabled === true && tree.id !== target);
+  }
+
   async disable() {
     const store = this.store;
     if (!store.tree || store.tryRunning || store.saving) return false;
     if (!store.tree.enabled) return true;
+    /* 停用默认图但仍有其它启用图：服务端会 409，先提示切换默认图，不发请求。 */
+    if (store.tree.default && this.hasOtherEnabledTree(this.treeId)) {
+      this.hooks.toast(t('cv.toastDisableDefaultBlocked'), 'warn');
+      return false;
+    }
     return this.setEnabled(false);
   }
 
@@ -258,9 +343,14 @@ export class RoutingController {
       const result = await api.post('/admin/trees/' + encodeURIComponent(this.treeId) + '/' + action);
       if (store.tree !== targetTree || this.treeId !== targetId) return false;
       if (result && Array.isArray(result.trees)) this.trees = result.trees;
+      /* v4：启停只维护目标图的 enabled/default（多图不互斥，第一张启用图自动
+         默认）。生命周期以服务端回包为准 —— 后续启用的图是 enabled && !default，
+         写 `default = enabled` 会让控制台把自己误标成默认图。 */
+      const updated = (Array.isArray(result && result.trees) ? result.trees : [])
+        .find(item => item && item.id === targetId);
+      if (!updated) throw new Error('lifecycle response is missing the current tree');
+      this.syncLifecycleBaseline(updated);
       if (result && result.snapshot_revision != null) this.snapshotRevision = result.snapshot_revision;
-      store.tree.enabled = !!enabled;
-      if (store.saved) store.saved.enabled = !!enabled;
       this.hooks.renderTreeSelect();
       /* 启用成功后重新校验当前草稿：服务端只回新 revision，Issue 条不能停在旧状态。 */
       this.hooks.setIssues(RTGraph.validate(store.tree.root));
@@ -271,6 +361,14 @@ export class RoutingController {
       return true;
     } catch (error) {
       if (store.tree !== targetTree || this.treeId !== targetId) return false;
+      /* 服务端竞态：页面里的启用图列表可能已过期（另一会话刚启用/切换了其它图），
+         停用默认图仍会被 409 default_graph_required 拒绝。此时服务器状态未变，
+         给与前端拦截相同的「先切换默认图」提示，绝不把结构化 detail 当原始 JSON
+         塞进泛化失败文案。 */
+      if (!enabled && error && error.detail && error.detail.code === 'default_graph_required') {
+        this.hooks.toast(t('cv.toastDisableDefaultBlocked'), 'warn');
+        return false;
+      }
       const issues = serverIssues(error);
       if (issues) {
         this.hooks.setIssues(this.mergeIssues(issues));
@@ -281,6 +379,45 @@ export class RoutingController {
         this.hooks.toast(tf(enabled ? 'cv.toastEnableFail' : 'cv.toastDisableFail',
           { err: apiErrText(error) }), 'error');
       }
+      return false;
+    } finally {
+      store.setSaving(false);
+      this.hooks.syncSaving();
+    }
+  }
+
+  /* 设为默认图（Task 8）：保存脏草稿 → POST /default → 用回包刷新完整 envelope。
+     生命周期写改了文档字节，必须刷新保存基线，否则紧接着的普通保存会 409
+     graph_conflict（brief 的真实浏览器场景会立即再保存一次）。 */
+  async setDefault() {
+    const store = this.store;
+    if (!store.tree || store.saving || store.tryRunning) return false;
+    if (store.dirtyKind !== 'clean' || !store.saved) {
+      const saved = await this.save();
+      if (!saved) return false;
+    }
+    store.setSaving(true);
+    this.hooks.syncSaving();
+    const targetTree = store.tree;
+    const targetId = this.treeId;
+    try {
+      const result = await api.post(
+        '/admin/trees/' + encodeURIComponent(targetId) + '/default');
+      if (store.tree !== targetTree || this.treeId !== targetId) return false;
+      if (Array.isArray(result.trees)) this.trees = result.trees;
+      const current = this.trees.find(item => item.id === targetId);
+      if (!current) throw new Error('default response is missing the current tree');
+      this.applySavedResponse({
+        tree: current,
+        snapshot_revision: result.snapshot_revision,
+      });
+      this.hooks.renderTreeSelect();
+      this.hooks.render();
+      this.hooks.refreshDirty();
+      this.hooks.toast(t('cv.toastDefault'));
+      return true;
+    } catch (error) {
+      this.hooks.toast(tf('cv.toastDefaultFail', { err: apiErrText(error) }), 'error');
       return false;
     } finally {
       store.setSaving(false);
@@ -327,43 +464,16 @@ export class RoutingController {
       if (!discard) return false;
     }
     /* 确认通过才换树：取消“新建”不能把在途的 switch 判成过期（loadTree 内部 bump）。 */
-    this.loadTree(this.newDraftTree(), false);
-    this.hooks.toast(t('cv.toastNewTree'));
-    return true;
-  }
-
-  async loadExample() {
-    /* 载入示例总是确认：clean 草稿用“替换整张图”文案，dirty 才提示丢弃改动。 */
-    const confirmed = await this.hooks.askDiscard('example',
-      this.store.dirtyKind === 'clean' ? CONFIRM_LOAD_EXAMPLE : null);
-    if (!confirmed) return false;
+    let tree;
     try {
-      const response = await fetch('routing/example.json', { cache: 'no-store' });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      /* 示例文件是完整 v3 文档（画布坐标在顶层 canvas）：用 parseImport 校验并
-         把坐标分发回内部 node.position，再整图替换。 */
-      const parsed = RTGraph.parseImport(await response.text());
-      if (!parsed.ok) throw new Error(parsed.error);
-      /* 示例是整图替换（不走 loadTree）：应用前让在途的 switch 过期，
-         否则旧回包会在示例落地后把草稿盖回去。 */
-      this.loadSeq += 1;
-      /* 示例是完整自包含文档：整图替换时连运行配置一起换（旧示例文件没有 runtime
-         时就是 null，不能残留载入前的配置）。 */
-      if (this.hooks.change('behavior', tree => {
-        tree.root = RTGraph.clone(parsed.tree.root);
-        tree.runtime = RTGraph.clone(parsed.tree.runtime);
-      }) === false) {
-        return false;
-      }
-      this.hooks.fitAfterReplace();
-      this.hooks.toast(t('cv.toastExampleLoaded'));
-      return true;
+      tree = this.newDraftTree();
     } catch (error) {
-      this.hooks.toast(tf('cv.toastLoadFail', {
-        err: String(error && error.message != null ? error.message : error),
-      }), 'error');
+      this.hooks.toast(String(error && error.message ? error.message : error), 'error');
       return false;
     }
+    this.loadTree(tree, false);
+    this.hooks.toast(t('cv.toastNewTree'));
+    return true;
   }
 
   exportTree() {
@@ -375,7 +485,7 @@ export class RoutingController {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = String(this.treeId || tree.id || 'tree') + '.sr-routing-graph-v3.json';
+      link.download = String(this.treeId || tree.id || 'tree') + '.sr-routing-graph-v4.json';
       link.rel = 'noopener';
       document.body.appendChild(link);
       link.click();
@@ -393,7 +503,7 @@ export class RoutingController {
     }
   }
 
-  /* 导入只接受 v3：先校验 kind/version（固定拒绝文案），再做结构校验；
+  /* 导入只接受 v4：先校验 kind/version（固定拒绝文案），再做结构校验；
      任何失败都保留当前草稿，合法导入作为一次历史操作替换完整 envelope。 */
   applyImport(text) {
     const result = RTGraph.parseImport(text);
@@ -406,12 +516,10 @@ export class RoutingController {
     const hard = issues.filter(issue => issue.level !== 'hint');
     if (!result.ok) {
       this.restoreDraftIssues();
-      if (hard.length) {
-        this.hooks.toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
-      } else {
-        const reason = result.error || 'invalid import';
-        this.hooks.toast(tf('cv.toastImportRejected', { err: reason }), 'error');
-      }
+      /* 解析级失败（无节点位置）必须把具体原因交给用户：只报问题数量会让人
+         无从下手，且被拒文件的 Issue 已被恢复成当前草稿的 Issue。 */
+      const reason = importFailureReason(result, hard) || 'invalid import';
+      this.hooks.toast(tf('cv.toastImportRejected', { err: reason }), 'error');
       return false;
     }
     if (hard.length) {
@@ -420,11 +528,12 @@ export class RoutingController {
       return false;
     }
     /* 导入同样整图替换（不走 loadTree）：应用前让在途的 switch 过期。
-       运行配置也在这一次历史里整体替换 —— 导入旧文档（无 runtime）必须清空
-       载入前的 runtime，撤销能恢复。 */
+       运行配置也在这一次历史里整体替换 —— 导入文档必须自带完整四字段快照，
+       撤销能恢复载入前的 runtime。 */
     this.loadSeq += 1;
     if (this.hooks.change('behavior', tree => {
       tree.name = result.tree.name;
+      tree.departments = RTGraph.clone(result.tree.departments);
       tree.timezone = result.tree.timezone;
       tree.sticky = RTGraph.clone(result.tree.sticky);
       tree.root = RTGraph.clone(result.tree.root);
@@ -463,10 +572,3 @@ export class RoutingController {
     this.applyImport(text);
   }
 }
-
-/* 载入示例总是确认；clean 草稿没有“丢弃”语义，用只描述替换整张图的文案。 */
-const CONFIRM_LOAD_EXAMPLE = {
-  title: 'cv.confirmLoadExample',
-  body: 'cv.confirmLoadExampleClean',
-  action: 'cv.confirmLoad',
-};

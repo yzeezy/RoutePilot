@@ -85,15 +85,17 @@ class FakeJev:
 
 
 class RecordingBalancer(LoadBalancer):
-    """记录 acquire 的 models/preferred/dry_run，其余调度语义复用真实 LoadBalancer。"""
+    """记录 acquire 的 models/preferred/dry_run/scope，其余调度语义复用真实 LoadBalancer。"""
 
     def __init__(self, breaker=None):
         super().__init__(breaker)
         self.calls = []
 
-    def acquire(self, models, *, preferred=None, dry_run=False):
-        self.calls.append({"models": list(models), "preferred": preferred, "dry_run": dry_run})
-        return super().acquire(models, preferred=preferred, dry_run=dry_run)
+    def acquire(self, models, *, preferred=None, dry_run=False, scope=''):
+        self.calls.append({"models": list(models), "preferred": preferred,
+                           "dry_run": dry_run, "scope": scope})
+        return super().acquire(
+            models, preferred=preferred, dry_run=dry_run, scope=scope)
 
 
 class RecordingAffinity(SessionAffinity):
@@ -137,6 +139,15 @@ class RecordingAffinity(SessionAffinity):
         )
 
 
+#: 求值层测试只关心拓扑：运行字段给最小合法值（快照的 backends/jev 另行传入）。
+EMPTY_RUNTIME = {
+    "backends": {"providers": [], "models": []},
+    "jev": None,
+    "jev_window": {"input_tokens": 1024, "context_tokens": 4096},
+    "time_periods": [],
+}
+
+
 def power_tree(*, root=None, sticky=None):
     return tree_from_dict({
         "id": "power-priority",
@@ -145,6 +156,7 @@ def power_tree(*, root=None, sticky=None):
         "timezone": "Asia/Shanghai",
         "sticky": sticky or {"enabled": False, "ttl_seconds": 1800},
         "root": POWER_GRAPH if root is None else root,
+        **EMPTY_RUNTIME,
     })
 
 
@@ -162,6 +174,7 @@ def custom_tree(nodes, edges, *, error_fallback, sticky=None):
             "edges": edges,
             "error_fallback": error_fallback,
         },
+        **EMPTY_RUNTIME,
     })
 
 

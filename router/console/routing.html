@@ -9,13 +9,7 @@
 
 <!-- 图标 sprite：全部内联，无外部请求。 -->
 <svg class="rtc-sprite" aria-hidden="true">
-  <symbol id="ri-undo" viewBox="0 0 16 16"><path d="M6.2 4.4 3.2 8l3 3.6"/><path d="M3.4 8h6.1a3.3 3.3 0 0 1 0 6.6H6.6"/></symbol>
-  <symbol id="ri-redo" viewBox="0 0 16 16"><path d="M9.8 4.4 12.8 8l-3 3.6"/><path d="M12.6 8H6.5a3.3 3.3 0 0 0 0 6.6h2.9"/></symbol>
-  <symbol id="ri-layout" viewBox="0 0 16 16"><rect x="2.4" y="2.4" width="4.2" height="4.2" rx="1"/><rect x="9.4" y="2.4" width="4.2" height="4.2" rx="1"/><rect x="5.9" y="9.4" width="4.2" height="4.2" rx="1"/><path d="M6.6 4.5h2.8M4.5 6.6v2.4M11.5 6.6v2.4"/></symbol>
-  <symbol id="ri-import" viewBox="0 0 16 16"><path d="M8 2.6v7.6"/><path d="M5 7.2l3 3 3-3"/><path d="M3 13.4h10"/></symbol>
-  <symbol id="ri-export" viewBox="0 0 16 16"><path d="M8 13V5.4"/><path d="M5 8.4l3-3 3 3"/><path d="M3 2.6h10"/></symbol>
   <symbol id="ri-play" viewBox="0 0 16 16"><path d="M5.8 3.6v8.8L13 8z" fill="currentColor" stroke="none"/></symbol>
-  <symbol id="ri-save" viewBox="0 0 16 16"><path d="M3.4 2.8h6.4L12.8 5.8V13.2H3.4z"/><path d="M5.6 2.8v3.1h4.6V2.8"/><path d="M5.4 13.2V9.5h5.2v3.7"/></symbol>
   <symbol id="ri-alert" viewBox="0 0 16 16"><path d="M8 2.6l5.6 10.2H2.4z"/><path d="M8 6.4v3.1"/><circle cx="8" cy="11.2" r=".72" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-check" viewBox="0 0 16 16"><path d="M3.2 8.6 6.2 11.6 12.8 4.9"/></symbol>
   <symbol id="ri-chev" viewBox="0 0 16 16"><path d="M6 3.6 10.4 8 6 12.4"/></symbol>
@@ -30,8 +24,6 @@
   <symbol id="ri-target" viewBox="0 0 16 16"><rect x="2.8" y="2.8" width="10.4" height="4" rx="1"/><rect x="2.8" y="9.2" width="10.4" height="4" rx="1"/><circle cx="5.1" cy="4.8" r=".7" fill="currentColor" stroke="none"/><circle cx="5.1" cy="11.2" r=".7" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-help" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M6.3 6.1a1.8 1.8 0 1 1 2.3 1.7c-.4.2-.6.5-.6.9v.3"/><circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-link" viewBox="0 0 16 16"><path d="M6.2 9.8 9.8 6.2"/><path d="M7 4.4 8.4 3a2.8 2.8 0 0 1 4 4L11 8.4M9 11.6 7.6 13a2.8 2.8 0 0 1-4-4L5 7.6"/></symbol>
-  <symbol id="ri-newtree" viewBox="0 0 16 16"><path d="M3.4 2.8h6.2l3 2.8"/><path d="M3.4 2.8v10.4h4.4"/><path d="M11.6 9.4v3.8M9.7 11.3h3.8"/></symbol>
-  <symbol id="ri-sample" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="6.6" height="6.6" rx="1"/><path d="M6.4 5.8h6.8v7.4H6.4z"/></symbol>
 </svg>
 
 <main class="rtc-main">
@@ -41,25 +33,44 @@
       <div class="rtc-crumb"><span data-i18n="cv.crumb"></span></div>
       <div class="rtc-h1">
         <select id="cvTreeSelect" class="rtc-treeselect" data-i18n-aria="cv.group" aria-label="决策组"></select>
-        <span class="pill rtc-rev" id="cvRevision">—</span>
-        <span class="pill ok" id="cvEnabled" hidden><span class="dot"></span><span id="cvEnabledLabel" data-i18n="cv.enabled"></span></span>
-        <span class="pill ok" id="cvClean"><span class="dot"></span><span data-i18n="cv.saved"></span></span>
-        <span class="pill warn" id="cvDirty" data-kind="clean" hidden></span>
+        <span class="pill" id="cvLifecycle" data-state="draft">
+          <!-- 首屏（boot 的两次 API 未回包）先显示与 data-state 一致的草稿标签，
+               首次 paintLifecycle() 会覆盖成本地真实状态。 -->
+          <span class="dot"></span><span id="cvLifecycleLabel" data-i18n="cv.status.draft"></span>
+        </span>
+        <!-- 多图生命周期：当前图是默认图（公开 /v1 只用默认图）时显示。 -->
+        <span class="pill ok" id="cvDefaultPill" data-i18n="cv.defaultPill" hidden></span>
         <span class="pill" id="cvSnapshotBadge" data-i18n="cv.snapshotBadge" hidden></span>
       </div>
     </div>
     <div class="rtc-headr">
       <div class="rtc-actions">
-        <button type="button" class="btn sm rtc-iconbtn" id="cvUndo" data-i18n-aria="cv.undo" title="撤销（⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-undo"/></svg></button>
-        <button type="button" class="btn sm rtc-iconbtn" id="cvRedo" data-i18n-aria="cv.redo" title="重做（⇧⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-redo"/></svg></button>
-        <button type="button" class="btn sm" id="cvAutoLayout"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-layout"/></svg><span data-i18n="cv.autoLayout"></span></button>
-        <button type="button" class="btn sm" id="cvNewTree"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-newtree"/></svg><span data-i18n="cv.newTree"></span></button>
-        <button type="button" class="btn sm" id="cvLoadExample"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-sample"/></svg><span data-i18n="cv.loadExample"></span></button>
-        <button type="button" class="btn sm" id="cvImport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-import"/></svg><span data-i18n="cv.import"></span></button>
-        <button type="button" class="btn sm" id="cvExport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-export"/></svg><span data-i18n="cv.export"></span></button>
-        <button type="button" class="btn sm" id="cvTryBtn"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg><span data-i18n="cv.try"></span></button>
-        <button type="button" class="btn sm pri" id="cvSave"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-save"/></svg><span data-i18n="cv.save"></span></button>
-        <button type="button" class="btn sm rtc-enable" id="cvEnable"><span class="rtc-swt"></span><span id="cvEnableLabel">未启用</span></button>
+        <!-- 编辑类动作全部平铺：早前收进「更多」折叠菜单，实测多点一次、菜单还会
+             盖住画布，用户明确要求展开直达（2026-11-23）。 -->
+        <div class="rtc-tools" role="group" data-i18n-aria="cv.tools">
+          <button type="button" class="btn sm" id="cvUndo" data-i18n="cv.undo"></button>
+          <button type="button" class="btn sm" id="cvRedo" data-i18n="cv.redo"></button>
+          <button type="button" class="btn sm" id="cvAutoLayout" data-i18n="cv.autoLayout"></button>
+          <!-- 保存按钮保留内层 span：updateToolbar 在请求在途时改写这里的忙碌文案。 -->
+          <button type="button" class="btn sm" id="cvSave"><span data-i18n="cv.saveDraft"></span></button>
+          <button type="button" class="btn sm" id="cvNewTree" data-i18n="cv.newTree"></button>
+          <button type="button" class="btn sm" id="cvImport" data-i18n="cv.import"></button>
+          <button type="button" class="btn sm" id="cvExport" data-i18n="cv.export"></button>
+          <!-- 多图生命周期：已启用但非默认的图可一键设为默认（默认图隐藏）。 -->
+          <button type="button" class="btn sm" id="cvDefault" data-i18n="cv.setDefault" hidden></button>
+          <button type="button" class="btn sm danger" id="cvDisable" data-i18n="cv.disable" hidden></button>
+        </div>
+        <button type="button" class="btn sm" id="cvTryBtn">
+          <svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg>
+          <span data-i18n="cv.try"></span>
+        </button>
+        <button type="button" class="btn sm pri" id="cvEnable">
+          <!-- 文案完全由 paintLifecycle() 拥有：不能带 data-i18n，否则 setLang 会把它
+               改回固定 key、覆盖真实状态。app.js 在模块加载时同步先画一次（此时
+               DOM 已就绪、store.tree 仍为 null），所以这里不留中文静态种子，
+               英文会话从第一帧起只会看到 cv.publish 的英文。 -->
+          <span id="cvEnableLabel"></span>
+        </button>
         <button type="button" class="pill rtc-issues-btn" id="cvIssuesBtn" aria-expanded="false">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-alert"/></svg>
           <span id="cvIssueText">0 错误 · 0 提示</span>
@@ -159,12 +170,12 @@
   <div class="rtc-dialog" id="cvDeleteBody" role="dialog" aria-modal="true"></div>
 </div>
 
-<!-- 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） -->
+<!-- 丢弃草稿确认（切组 / 导入 / 新建共用） -->
 <div class="rtc-modal" id="cvConfirmModal" hidden>
   <div class="rtc-dialog" id="cvConfirmBody" role="dialog" aria-modal="true"></div>
 </div>
 
-<!-- 导入 v3 图（隐藏文件选择器） -->
+<!-- 导入 v4 图（隐藏文件选择器） -->
 <input type="file" id="cvImportFile" accept=".json,application/json" hidden>
 
 <!-- toast -->

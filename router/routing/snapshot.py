@@ -2,34 +2,32 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import threading
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
-from router.control.runtime import enable_context_for_runtime, snapshot_parts
-from router.control.validation import build_enable_context
+from router.control.runtime import (
+    enable_context_for_runtime,
+    snapshot_parts,
+)
 from router.jev.config import JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_INPUT_TOKENS,
-    MAX_TOKENS,
-    MIN_CONTEXT_TOKENS,
-    MIN_INPUT_TOKENS,
 )
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import CompiledGraph, compile_graph
 from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
+from router.routing.route_set import RouteSetInvariantError, route_set_indices
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
-from router.routing.types import RoutingMiss
-from router.store.jev_config import JevConfigRepo
-from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
+from router.routing.types import NoActiveTreeError, NoDefaultTreeError, RoutingMiss
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
-from router.upstream.catalog import Backend, load_backends
+from router.upstream.catalog import Backend
 
 
 @dataclass(frozen=True)
@@ -64,23 +62,6 @@ class RoutingSnapshot:
                 "snapshot has no compiled graph; build it with compile_graph(root)"
             )
         return self.compiled
-
-
-def model_capability(row: dict) -> str:
-    """models 行 → capability 文本（profile.capability，缺省空串）。
-
-    公开入口：启动快照、草稿试算快照共用同一读取规则（原私有名 `_capability`）。
-    """
-    profile = row.get("profile")
-    if isinstance(profile, str):
-        try:
-            profile = json.loads(profile)
-        except ValueError:
-            return ""
-    if not isinstance(profile, dict):
-        return ""
-    value = profile.get("capability")
-    return value.strip() if isinstance(value, str) else ""
 
 
 def _snapshot_backend(backend: Backend) -> Backend:
@@ -156,76 +137,153 @@ def build_snapshot(
     )
 
 
-def _int_setting(repo: SettingsRepo, key: str, default: int, minimum: int, maximum: int) -> int:
-    raw = repo.get(key)
-    if raw is None:
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, value))
-
-
-def read_jev_window(conn) -> tuple[int, int]:
-    """返回 (input_tokens, context_tokens)；缺省/非法值回落到默认值。"""
-    repo = SettingsRepo(conn)
-    context_tokens = _int_setting(repo, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, MAX_TOKENS)
-    input_tokens = _int_setting(repo, "jev_input_tokens", DEFAULT_INPUT_TOKENS, MIN_INPUT_TOKENS, context_tokens)
-    if input_tokens > context_tokens:
-        input_tokens = context_tokens
-    return input_tokens, context_tokens
-
-
 def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
-    """活动树快照：内嵌运行配置优先，旧图/无活动图回退数据库装配。
+    """单图运行快照：唯一来源是画布内嵌运行配置。
 
-    两条路径的校验上下文严格分开：只有 ``tree.runtime is not None`` 才使用
-    图内配置；旧图继续使用宽松的数据库上下文，避免旧库非法历史声明阻断启动。
+    - ``tree is None``：空 Auto 快照（没有启用图时没有隐式数据库装配）。
+    - ``tree is not None``：用画布自身运行配置做启用校验 → 编译 → 装配快照。
+      数据库只用于解析已存密钥；目录行与画布不一致不改变快照内容。
     """
-    compiled = None
-    if tree is not None and tree.runtime is not None:
-        issues = validate_graph_for_enable(
-            tree, enable_context_for_runtime(tree.runtime))
-        if issues:
-            codes = ",".join(sorted({issue.code for issue in issues}))
-            raise GraphStorageError(f"invalid active graph: {codes}")
-        # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
-        compiled = compile_graph(tree.root)
+    if tree is None:
         return build_snapshot(
-            tree=tree,
-            **snapshot_parts(conn, tree.runtime),
-            compiled=compiled,
+            tree=None,
+            backends={},
+            time_periods=[],
+            jev=None,
+            capabilities={},
         )
-
-    # ── 旧图（无内嵌运行配置）与无活动图：沿用原数据库装配路径 ──────────
-    if tree is not None:
-        issues = validate_graph_for_enable(tree, build_enable_context(conn))
-        if issues:
-            codes = ",".join(sorted({issue.code for issue in issues}))
-            raise GraphStorageError(f"invalid active graph: {codes}")
-        compiled = compile_graph(tree.root)
-    input_tokens, context_tokens = read_jev_window(conn)
+    issues = validate_graph_for_enable(tree, enable_context_for_runtime(tree.runtime))
+    if issues:
+        codes = ",".join(sorted({issue.code for issue in issues}))
+        raise GraphStorageError(f"invalid enabled graph: {codes}")
+    # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
+    compiled = compile_graph(tree.root)
     return build_snapshot(
         tree=tree,
-        backends=load_backends(conn),
-        time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
-        jev=JevConfigRepo(conn).load(),
-        capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
-        jev_input_tokens=input_tokens,
-        jev_context_tokens=context_tokens,
+        **snapshot_parts(conn, tree.runtime),
         compiled=compiled,
     )
 
 
-def load_snapshot(conn, trees: RoutingTreeRepo) -> RoutingSnapshot:
-    return build_snapshot_for_tree(conn, trees.active())
+@dataclass(frozen=True)
+class RouteSetSelection:
+    """一次按部门选图的结果：``reason`` 为 ``department`` / ``default``。"""
+
+    snapshot: RoutingSnapshot
+    reason: str
 
 
 @dataclass(frozen=True)
-class PreparedSnapshot:
-    snapshot: RoutingSnapshot
-    fingerprint: tuple[str | None, str]
+class RoutingSnapshotSet:
+    """不可变发布单元：所有启用图的快照 + 默认图/部门索引。
+
+    ``snapshots`` / ``department_tree_ids`` 用 ``MappingProxyType`` 固定；
+    ``content`` 只含非密钥版本信息（默认图 id、排序后的部门映射、每图
+    ``snapshot_revision``），``snapshot_revision`` 是它的 sha256。
+    """
+
+    snapshots: Mapping[str, RoutingSnapshot]
+    default_tree_id: str | None
+    department_tree_ids: Mapping[str, str]
+    snapshot_revision: str
+    content: str
+    fingerprint: str
+
+    @property
+    def default_snapshot(self) -> RoutingSnapshot | None:
+        """默认启用图的快照；零启用图返回 ``None``。"""
+        return self.snapshots.get(self.default_tree_id) if self.default_tree_id else None
+
+    def select(self, department: str = "") -> RouteSetSelection:
+        """按部门选图：精确匹配部门图，否则回退默认图。
+
+        零启用图抛 ``NoActiveTreeError``；有启用图但缺默认图（不变量损坏）
+        抛 ``NoDefaultTreeError``。
+        """
+        if not self.snapshots:
+            raise NoActiveTreeError('no routing tree is enabled')
+        tree_id = self.department_tree_ids.get(department) if department else None
+        if tree_id is not None:
+            return RouteSetSelection(self.snapshots[tree_id], 'department')
+        if self.default_tree_id is None:
+            raise NoDefaultTreeError('no default routing tree is enabled')
+        return RouteSetSelection(self.snapshots[self.default_tree_id], 'default')
+
+
+def assemble_snapshot_set(
+        snapshots: Iterable[RoutingSnapshot], fingerprint: str) -> RoutingSnapshotSet:
+    """把各启用图快照装配成不可变路由集（集合不变量在装配点校验）。
+
+    路由集成员必须都带树且都是**启用**图：空 Auto 快照与停用草稿都不属于
+    路由集（``select()`` 只会选启用图，混入停用图会让它被当作可服务图）。
+    ``RouteSetInvariantError`` 由调用方决定如何呈现；``load_snapshot_set()``
+    在装配边界转成存储错误。
+    """
+    ordered = list(snapshots)
+    if any(item.tree is None for item in ordered):
+        raise ValueError('routing snapshot set requires snapshots with a tree')
+    disabled = sorted(item.tree.id for item in ordered if not item.tree.enabled)
+    if disabled:
+        raise ValueError(
+            'routing snapshot set requires enabled graphs only: '
+            + ', '.join(disabled))
+    ordered.sort(key=lambda item: item.tree.id)
+    default_id, mapping = route_set_indices([item.tree for item in ordered])
+    department_tree_ids = dict(sorted(mapping.items()))
+    document = {
+        'default_tree_id': default_id,
+        'department_tree_ids': department_tree_ids,
+        'snapshots': {item.tree_id: item.snapshot_revision for item in ordered},
+    }
+    content = canonical_json(document)
+    revision = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    return RoutingSnapshotSet(
+        snapshots=MappingProxyType({item.tree_id: item for item in ordered}),
+        default_tree_id=default_id,
+        department_tree_ids=MappingProxyType(department_tree_ids),
+        snapshot_revision=revision,
+        content=content,
+        fingerprint=fingerprint,
+    )
+
+
+def build_snapshot_set_for_trees(conn, trees: Iterable[RoutingTree],
+                                 fingerprint: str) -> RoutingSnapshotSet:
+    """对每份启用图执行启用校验/编译/装配，再装配成路由集。"""
+    return assemble_snapshot_set(
+        [build_snapshot_for_tree(conn, tree) for tree in trees], fingerprint)
+
+
+def invalid_route_set_error(exc: RouteSetInvariantError) -> GraphStorageError:
+    """装配边界的统一错误映射：路由集不变量损坏 → 存储错误（HTTP 503）。
+
+    ``assemble_snapshot_set()`` 是纯函数，继续抛 ``RouteSetInvariantError``；
+    凡是在加载/发布边界把磁盘或候选树交给它（或直接索引启用集合）的地方都经
+    这里转换，避免损坏的 standalone JSON 把管理写路径打成 500。
+    """
+    return GraphStorageError(f"invalid route set: {exc.code}")
+
+
+def load_snapshot_set(conn, repo: RoutingTreeRepo) -> RoutingSnapshotSet:
+    """从磁盘扫描结果构造完整启用路由集。
+
+    先取指纹再读树；集合不变量（恰好一张默认图、部门唯一）在装配边界转成
+    ``GraphStorageError``：发布器保留旧路由集并报告 ``stale``，而不是把损坏
+    文件打成 500。
+    """
+    fingerprint = repo.route_fingerprint()
+    try:
+        return build_snapshot_set_for_trees(conn, repo.enabled(), fingerprint)
+    except RouteSetInvariantError as exc:
+        raise invalid_route_set_error(exc) from exc
+
+
+@dataclass(frozen=True)
+class PreparedRouteSet:
+    """待发布的路由集及其指纹（COMMIT 前复核用）。"""
+
+    snapshot_set: RoutingSnapshotSet
+    fingerprint: str
 
 
 class SnapshotPublisher:
@@ -233,7 +291,7 @@ class SnapshotPublisher:
         self.app = app
         self.trees = trees
         self._lock = threading.RLock()
-        self._fingerprint: tuple[str | None, str] | None = None
+        self._fingerprint: str | None = None
         self._loaded_at = ""
         self._last_error = ""
 
@@ -242,49 +300,66 @@ class SnapshotPublisher:
         with self._lock:
             yield self
 
-    def prepare(self, conn, tree: RoutingTree | None,
-                fingerprint: tuple[str | None, str]) -> PreparedSnapshot:
-        return PreparedSnapshot(build_snapshot_for_tree(conn, tree), fingerprint)
+    def prepare(self, conn, trees: Iterable[RoutingTree],
+                fingerprint: str) -> PreparedRouteSet:
+        """装配候选路由集；不变量损坏在装配边界转成 ``GraphStorageError``。
 
-    def publish(self, prepared: PreparedSnapshot) -> RoutingSnapshot:
+        候选树可能来自手装的 standalone JSON（如启用图但没有默认图），
+        与 ``load_snapshot_set()`` 一样走存储错误（503），而不是把
+        GraphService/ConfigurationService 的写路径打成 500。
+        """
+        try:
+            snapshot_set = build_snapshot_set_for_trees(conn, trees, fingerprint)
+        except RouteSetInvariantError as exc:
+            raise invalid_route_set_error(exc) from exc
+        return PreparedRouteSet(snapshot_set, fingerprint)
+
+    def publish(self, prepared: PreparedRouteSet) -> RoutingSnapshotSet:
         with self._lock:
-            self.app.state.snapshot = prepared.snapshot
+            snapshot_set = prepared.snapshot_set
+            if snapshot_set.fingerprint != prepared.fingerprint:
+                # GraphService 的候选路由集在写盘前只能带占位指纹；发布是唯一
+                # 确定「发布时指纹」的点，必须把它盖到集合上，发布状态里的
+                # 集合指纹才与 ``status()["route_fingerprint"]`` 一致。
+                snapshot_set = replace(snapshot_set, fingerprint=prepared.fingerprint)
+            self.app.state.snapshot_set = snapshot_set
             self._fingerprint = prepared.fingerprint
             self._loaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._last_error = ""
-            return prepared.snapshot
+            return snapshot_set
 
-    def refresh(self, conn) -> RoutingSnapshot:
+    def refresh(self, conn) -> RoutingSnapshotSet:
         with self._lock:
             try:
-                fingerprint = self.trees.fingerprint()
-                prepared = PreparedSnapshot(load_snapshot(conn, self.trees), fingerprint)
-                if self.trees.fingerprint() != fingerprint:
+                route_set = load_snapshot_set(conn, self.trees)
+                if self.trees.route_fingerprint() != route_set.fingerprint:
                     raise GraphChangedDuringLoad("graph changed while building snapshot")
-                return self.publish(prepared)
+                return self.publish(PreparedRouteSet(route_set, route_set.fingerprint))
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
-    def refresh_if_changed(self, conn) -> RoutingSnapshot | None:
+    def refresh_if_changed(self, conn) -> RoutingSnapshotSet | None:
         with self._lock:
             try:
-                if self._fingerprint is not None and self.trees.fingerprint() == self._fingerprint:
+                if self._fingerprint is not None and self.trees.route_fingerprint() == self._fingerprint:
                     # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
                     self._last_error = ""
-                    return self.app.state.snapshot
+                    return self.app.state.snapshot_set
                 return self.refresh(conn)
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
     def status(self) -> dict:
-        fingerprint = self._fingerprint or (None, "")
+        route_set = self.app.state.snapshot_set
         return {
-            "ready": self.app.state.snapshot is not None,
+            "ready": route_set is not None,
             "stale": bool(self._last_error),
-            "active_id": fingerprint[0],
-            "document_sha256": fingerprint[1],
+            "default_tree_id": route_set.default_tree_id if route_set is not None else None,
+            "enabled_tree_ids": sorted(route_set.snapshots) if route_set is not None else [],
+            "snapshot_revision": route_set.snapshot_revision if route_set is not None else "",
+            "route_fingerprint": self._fingerprint or "",
             "loaded_at": self._loaded_at,
             "last_load_error": self._last_error,
         }

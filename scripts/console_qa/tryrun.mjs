@@ -15,6 +15,7 @@ import {
   TRY_SAMPLES,
   api,
   assertIncludes,
+  clickCanvasAction,
   dragNodeBy,
   ensureBaselineTree,
   expectHttpStatusError,
@@ -823,7 +824,7 @@ const { setLang, t, tf } = await import('/console/i18n.js');
   assert.equal(again.result, true, 'a no-op wave layout should still succeed');
   assert.equal(again.replay, true, 'a no-op wave layout cleared the replay');
   assert.equal(again.toast, again.same, 'a no-op wave layout toasted the moved copy');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async previous => {
     const { app, store } = await import('/console/routing/app.js');
 
@@ -978,7 +979,9 @@ test('try-uses-draft-timezone-and-sticky', async () => {
       const { app } = await import('/console/routing/app.js');
       const runtime = app.tree.runtime;
       return {
+        jevId: runtime.jev && runtime.jev.id,
         jevBase: runtime.jev.base_url,
+        jevWindow: runtime.jev_window,
         providerUrl: runtime.backends.providers[0].base_url,
         periods: runtime.time_periods.map(period => period.name)
 };
@@ -999,6 +1002,14 @@ test('try-uses-draft-timezone-and-sticky', async () => {
       'try payload sent a different runtime catalog than the draft');
     assert.equal(payload.jev.base_url, expectedRuntime.jevBase,
       'try payload did not carry the draft runtime JEV endpoint');
+    /* 严格自包含：payload 带 JEV 服务 id，且不存在 runtime:null / 嵌套 runtime 控制字段。 */
+    assert.ok(expectedRuntime.jevId, 'the draft runtime has no JEV service id');
+    assert.equal(payload.jev.id, expectedRuntime.jevId,
+      'try payload did not carry the draft runtime JEV service id');
+    assert.deepEqual(payload.jev_window, expectedRuntime.jevWindow,
+      'try payload did not carry the draft JEV window');
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, 'runtime'), false,
+      'try payload sent the removed runtime control field');
     assert.equal(payload.backends.providers[0].base_url, expectedRuntime.providerUrl,
       'try payload did not carry the draft runtime provider endpoint');
     assert.ok(payload.root && payload.root.nodes.length === EXAMPLE_NODES,
@@ -1134,6 +1145,100 @@ test('try result keeps the graph and verdict without an execution trace drawer',
   assert.ok(state.finalNodes > 0, 'the replay lost its final node highlight');
   assert.deepEqual(state.drawerApi, [], 'the trial trace drawer API still exists');
   assert.equal(state.execHeight, false, 'the removed execution resize left a pinned height');
+});
+
+/* ── Task 16 · 画布/目录漂移是 hint-only ───────────────────────────────
+   真实 /admin/try 路径：把**画布草稿快照**里的模型 capability 改成与数据库
+   目录不同，服务端会把它作为 runtime_mismatch（level=hint）返回；控制台必须
+   渲染可见的提示行，且结论/运行态保持正常，不能升级成 routing_error。 */
+test('Task 16 · catalog drift renders hint-only rows and never flips the run to an error', async () => {
+  await prepareTryCanvas();
+  const drift = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const models = app.tree.runtime.backends.models;
+    const model = models.find(item => item && item.profile) || models[0];
+    const previous = {
+      id: model.id,
+      profile: JSON.parse(JSON.stringify(model.profile || {}))
+    };
+    model.profile = Object.assign({}, model.profile || {}, {
+      capability: 'QA 画布快照里的旧能力说明（与数据库目录不同）'
+    });
+    return previous;
+  });
+  try {
+    await runTrySample(0);
+    const snap = await trySnapshot();
+    /* 执行结论仍来自画布快照；提示不许把试算变成失败态。 */
+    assert.equal(snap.final.target_id, 'power-target',
+      'a hint-only drift changed the routing outcome');
+    assert.equal(snap.resultKind, 'target', 'a hint-only drift changed the result kind');
+    assert.equal(snap.resultHidden, false, 'a hint-only drift hid the verdict panel');
+    assert.equal(snap.running, false, 'a hint-only drift left the run lock on');
+    assert.equal(snap.runDisabled, false, 'the run button stayed disabled after a hint-only result');
+    const replay = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        error: app.replay.error || null,
+        warnings: app.replay.warnings.map(item => ({ code: item.code, level: item.level }))
+      };
+    });
+    assert.equal(replay.error, null, 'a catalog drift hint produced a routing error');
+    assert.deepEqual(
+      replay.warnings.filter(item => item.code === 'runtime_mismatch').map(item => item.level),
+      ['hint'], 'runtime_mismatch was not reported as a hint');
+
+    /* 提示列表可见，并逐行给出画布/数据库两侧值。 */
+    const hint = await page.evaluate(() => {
+      const host = document.getElementById('cvTryResult');
+      const box = host.querySelector('[data-runtime-mismatch]');
+      if (!box) return null;
+      const style = getComputedStyle(box);
+      return {
+        count: Number(box.dataset.runtimeMismatch),
+        visible: !!(box.offsetWidth || box.offsetHeight || box.getClientRects().length) &&
+          style.display !== 'none' && style.visibility !== 'hidden',
+        title: (box.querySelector('.rtc-try-cmp-l') || { textContent: '' }).textContent.trim(),
+        rows: [...box.querySelectorAll('.rtc-try-cmp .rtc-try-note')].map(row => ({
+          text: row.textContent.replace(/\s+/g, ' ').trim(),
+          warn: row.classList.contains('is-warn')
+        })),
+        errorBadge: !!host.querySelector('[data-routing-error]'),
+        errorKind: !!host.querySelector('.rtc-try-kind.is-fb'),
+        kind: host.dataset.kind,
+        errorAttr: host.dataset.error || ''
+      };
+    });
+    assert.ok(hint, 'the runtime_mismatch hint list is missing from the result panel');
+    assert.equal(hint.count, 1, 'the result panel reported the wrong hint count: ' + hint.count);
+    assert.equal(hint.visible, true, 'the runtime_mismatch hint list is hidden');
+    assert.match(hint.title, /目录差异|Catalog drift/,
+      'the hint list has no localized title: ' + hint.title);
+    assert.equal(hint.rows.length, 1, 'the hint list did not render exactly one drift row');
+    assert.match(hint.rows[0].text, new RegExp(drift.id),
+      'the drift row does not name the model: ' + hint.rows[0].text);
+    assert.match(hint.rows[0].text, /profile\.capability/,
+      'the drift row does not name the differing field: ' + hint.rows[0].text);
+    assert.match(hint.rows[0].text, /画布|canvas/,
+      'the drift row does not show the canvas value: ' + hint.rows[0].text);
+    assert.match(hint.rows[0].text, /数据库|database/,
+      'the drift row does not show the database value: ' + hint.rows[0].text);
+    assert.equal(hint.rows[0].warn, true, 'the drift row is not styled as a warning hint');
+    assert.equal(hint.errorBadge, false, 'a hint-only drift rendered the routing-error badge');
+    assert.equal(hint.errorKind, false, 'a hint-only drift rendered the error kind badge');
+    assert.equal(hint.kind, 'target', 'a hint-only drift changed the result kind');
+    assert.equal(hint.errorAttr, '', 'a hint-only drift set the error dataset');
+    await screenshot('task16-runtime-mismatch-hint.png');
+  } finally {
+    await page.evaluate(async previous => {
+      const { app } = await import('/console/routing/app.js');
+      const model = app.tree.runtime.backends.models.find(item => item.id === previous.id);
+      if (model) model.profile = previous.profile;
+      const RTTryRun = await import('/console/routing/tryrun.js');
+      RTTryRun.clear();
+    }, drift).catch(() => {});
+    await ensureBaselineTree();
+  }
 });
 
 await runIfMain(import.meta.url);

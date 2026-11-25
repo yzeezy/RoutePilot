@@ -15,14 +15,19 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from router.api import routes_models
 from router.api.app import create_app
 from router.reasoning import FORMAT_IDS, LEVELS
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.repositories import ProviderRepo, seed_default
+from router.store.repositories import ModelRepo, ProviderRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import load_backends
-from tests.routing_fixtures import portable_tree_dict, test_settings, tree_dict
+from tests.routing_fixtures import (
+    portable_tree_dict,
+    runtime_for_models,
+    test_settings,
+)
 
 OPENAI_REASONING = {"reasoning": {
     "efforts": {"off": None, "low": "low", "high": "high"},
@@ -42,6 +47,26 @@ def app(tmp_path):
 @pytest.fixture
 def client(app):
     return TestClient(app)
+
+
+def _confirmation_from(response) -> dict:
+    """409 影响预览 → 携带当前画布哈希的确认载荷。"""
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required", response.text
+    return {"trees": [
+        {"id": item["id"], "document_sha256": item["document_sha256"]}
+        for item in detail["affected_trees"]
+    ]}
+
+
+def put_with_confirmation(client, path: str, payload: dict):
+    """目录写两阶段：先 409 预览，再用预览哈希确认重试。"""
+    preview = client.put(path, json=payload)
+    if preview.status_code != 409:
+        return preview
+    return client.put(path, json={
+        **payload, "impact_confirmation": _confirmation_from(preview)})
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +160,7 @@ def test_invalid_old_profile_json_normalizes_to_empty_object(tmp_path):
 # --------------------------------------------------------------------------- #
 # POST /admin/models
 # --------------------------------------------------------------------------- #
-def test_create_model_and_swap_backend_snapshot(client, app):
+def test_create_model_records_catalog_state_and_audit(client, app):
     r = client.post("/admin/models", json={
         "id": "my-model", "upstream": "upstream-v1", "provider": "local",
         "profile": OPENAI_REASONING})
@@ -149,12 +174,8 @@ def test_create_model_and_swap_backend_snapshot(client, app):
     assert model["reasoning"]["declared"] is True
     assert model["reasoning"]["format"] == "openai"
     assert client.get("/admin/models").json()["models"]
-    backend = app.state.snapshot.backends["my-model"]
-    assert backend.upstream_name == "upstream-v1"
-    assert backend.provider == "local"
-    assert backend.reasoning["efforts"] == [
-        {"id": "off", "wire": None}, {"id": "low", "wire": "low"},
-        {"id": "high", "wire": "high"}]
+    # 零启用图：路由集为空，目录写不再投影到 snapshot。
+    assert app.state.snapshot_set.snapshots == {}
     # audit row
     changes = client.get("/admin/changes").json()["changes"]
     assert changes[0]["kind"] == "model"
@@ -201,6 +222,65 @@ def test_create_model_rejects_illegal_profile(client, profile):
                                 client.get("/admin/models").json()["models"]}
 
 
+NON_FINITE_LITERALS = ("NaN", "Infinity", "-Infinity")
+
+
+@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+def test_model_writes_reject_non_finite_profile_floats(client, app, literal):
+    """NaN/Infinity 不是合法 JSON：POST/PUT 在写库前 422，行/审计/快照零改动。
+
+    ``json.loads`` 接受这三个字面量，但 Starlette 的 JSONResponse 用
+    ``allow_nan=False`` 序列化 —— 一旦写进 ``models.profile``，该行之后的
+    echo/GET 直接 500。管理写路径必须落库前拒绝。
+    """
+    conn = connect(app.state.settings.db_path)
+    try:
+        before_rows = conn.execute(
+            "SELECT id, upstream, provider, profile FROM models ORDER BY id").fetchall()
+        before_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+    finally:
+        conn.close()
+    before_revision = app.state.snapshot_set.snapshot_revision
+
+    # 1) profile 传 JSON 字符串：递归命中嵌套数组里的非有限值，并点名路径。
+    nested = '{"metadata": {"labels": [{"score": %s}]}}' % literal
+    created = client.post("/admin/models", json={
+        "id": "non-finite-model", "upstream": "u", "provider": "local",
+        "profile": nested})
+    assert created.status_code == 422, created.text
+    assert "非 JSON 兼容数值" in created.text
+    assert "profile.metadata.labels[0].score" in created.text
+
+    # 2) 原始 JSON 请求体（httpx 的 json= 会先拒绝 NaN，因此手写 content）。
+    raw = ('{"upstream": "u", "profile": {"metadata": {"threshold": %s}}}'
+           % literal)
+    updated = client.put("/admin/models/qwen3-8b", content=raw,
+                         headers={"Content-Type": "application/json"})
+    assert updated.status_code == 422, updated.text
+    assert "非 JSON 兼容数值" in updated.text
+    assert "profile.metadata.threshold" in updated.text
+
+    # 数据库行、审计与已发布快照均未变化（没有落库，也就不会 echo 500）。
+    conn = connect(app.state.settings.db_path)
+    try:
+        after_rows = conn.execute(
+            "SELECT id, upstream, provider, profile FROM models ORDER BY id").fetchall()
+        after_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+    finally:
+        conn.close()
+    assert after_rows == before_rows
+    assert after_audit == before_audit
+    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert client.get("/admin/models").status_code == 200
+
+    # 合法有限浮点元数据照常保存（拒绝只针对非 JSON 兼容值）。
+    ok = client.put("/admin/models/qwen3-8b", json={
+        "profile": {"metadata": {"threshold": 0.5, "count": 2}}})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["model"]["profile"] == {
+        "metadata": {"threshold": 0.5, "count": 2}}
+
+
 def test_create_model_inherits_provider_reasoning_format(client, app):
     r = client.put("/admin/providers/local", json={
         "base_url": "http://127.0.0.1:9000", "reasoning_format": "deepseek"})
@@ -211,7 +291,18 @@ def test_create_model_inherits_provider_reasoning_format(client, app):
         "profile": {"reasoning": {"efforts": {"off": None, "high": None}}}})
     assert r.status_code == 201, r.text
     assert r.json()["model"]["reasoning"]["format"] == "deepseek"
-    assert app.state.snapshot.backends["deep-model"].reasoning["format"] == "deepseek"
+    # rationale: 快照来自自包含画布；这里显式把目录事实固化进画布再断言投影。
+    root = _direct_graph((("deep-model", None),))
+    runtime = _tree_runtime(root)
+    runtime["backends"]["providers"][0]["reasoning_format"] = "deepseek"
+    runtime["backends"]["providers"][0]["base_url"] = "http://127.0.0.1:9000"
+    runtime["backends"]["models"][0]["profile"] = {
+        "reasoning": {"efforts": {"off": None, "high": None}}}
+    created = client.post("/admin/trees", json={
+        "id": "deep-canvas", "name": "Deep", "root": root, **runtime})
+    assert created.status_code == 201, created.text
+    assert client.post("/admin/trees/deep-canvas/enable").status_code == 200
+    assert app.state.snapshot_set.default_snapshot.backends["deep-model"].reasoning["format"] == "deepseek"
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +353,25 @@ def test_put_model_rejects_unknown_provider(client, app):
         conn.close()
 
 
+def _tree_runtime(root, *, model_overrides=None):
+    """root 引用的模型 id → 自包含运行字段（可选覆写 profile）。"""
+    ids: list[str] = []
+    for node in root.get("nodes") or ():
+        if node.get("type") != "target":
+            continue
+        for slot in node.get("models") or ():
+            model = slot.get("model") if isinstance(slot, dict) else slot
+            if isinstance(model, str) and model not in ids:
+                ids.append(model)
+    runtime = runtime_for_models(ids)
+    for override in (model_overrides or {}).items():
+        model_id, profile = override
+        for model in runtime["backends"]["models"]:
+            if model["id"] == model_id:
+                model["profile"] = profile
+    return runtime
+
+
 def _direct_graph(models, *, node_id="direct", fallback="direct"):
     """start → target 的 graph v3 根；用于模型引用/推理档位回归。"""
     return {
@@ -280,13 +390,13 @@ def _direct_graph(models, *, node_id="direct", fallback="direct"):
     }
 
 
-def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
-    """Reference check walks the SAVED routing trees: a direct graph target and
-    a choice option target both block the delete, and every finding names its
-    tree/node (``via``)."""
+def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client, app):
+    """删除被引用模型：未确认 409 影响清单（每幅画布列出 target 使用位置），
+    确认缺替代 → 422，确认带替代 → 200 并同步所有受影响画布。"""
     route_root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref", "root": route_root})
+        "id": "ref-tree", "name": "Ref", "root": route_root,
+        **_tree_runtime(route_root)})
     assert created.status_code == 201, created.text
     nl_root = {
         "id": "root", "type": "graph",
@@ -314,20 +424,40 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
         "error_fallback": "deep-target",
     }
     created = client.post("/admin/trees", json={
-        "id": "nl-ref", "name": "NL Ref", "root": nl_root})
+        "id": "nl-ref", "name": "NL Ref", "root": nl_root,
+        **_tree_runtime(nl_root)})
     assert created.status_code == 201, created.text
 
     r = client.delete("/admin/models/qwen3-8b")
     assert r.status_code == 409
     detail = r.json()["detail"]
-    assert "路由树引用" in detail["message"]
-    refs = detail["references"]
-    assert {ref["tree_id"] for ref in refs} == {"ref-tree", "nl-ref"}
-    for ref in refs:
-        assert ref["tree_id"] and ref["node_id"] and ref["via"]
-        assert "tree_revision" in ref
+    assert detail["code"] == "impact_confirmation_required"
+    assert {item["id"] for item in detail["affected_trees"]} == {"ref-tree", "nl-ref"}
+    usages = {item["id"]: item["usage"] for item in detail["affected_trees"]}
+    assert usages["ref-tree"]["targets"] == ["direct"]
+    assert usages["nl-ref"]["targets"] == ["fast-target"]
+    assert all(usage["runtime_catalog"] is True for usage in usages.values())
     assert "qwen3-8b" in {m["id"] for m in
                           client.get("/admin/models").json()["models"]}
+
+    # 确认但缺替代模型 → 422（target 仍引用）；确认带替代模型 → 200 且同步两幅画布。
+    confirmation = _confirmation_from(r)
+    missing = client.request("DELETE", "/admin/models/qwen3-8b", json={
+        "impact_confirmation": confirmation})
+    assert missing.status_code == 422
+    deleted = client.request("DELETE", "/admin/models/qwen3-8b", json={
+        "replacement_model_id": "qwen3-32b",
+        "impact_confirmation": confirmation})
+    assert deleted.status_code == 200, deleted.text
+    assert sorted(deleted.json()["synced_trees"]) == ["nl-ref", "ref-tree"]
+    for tree_id in ("ref-tree", "nl-ref"):
+        target_models = {
+            slot.model
+            for node in app.state.graph_repo.get(tree_id).root.nodes
+            for slot in getattr(node, "models", ())
+        }
+        assert "qwen3-8b" not in target_models
+        assert "qwen3-32b" in target_models
 
     assert client.delete("/admin/models/nope").status_code == 404
     # unreferenced model deletes fine
@@ -341,30 +471,49 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
 # --------------------------------------------------------------------------- #
 # Providers: key tri-state / key_source / never returning the secret
 # --------------------------------------------------------------------------- #
+def _activate_provider_canvas(client, base_url, model="qwen3-8b", provider="local",
+                              key_env=""):
+    root = _direct_graph(((model, None),))
+    runtime = _tree_runtime(root)
+    runtime["backends"]["providers"][0].update({
+        "name": provider, "base_url": base_url, "key_env": key_env,
+    })
+    runtime["backends"]["models"][0]["provider"] = provider
+    created = client.post("/admin/trees", json={
+        "id": "provider-canvas", "name": "Provider", "root": root, **runtime})
+    assert created.status_code == 201, created.text
+    assert client.post("/admin/trees/provider-canvas/enable").status_code == 200
+
+
 def test_provider_key_tristate_and_headers(client, app):
     base = {"base_url": "http://127.0.0.1:9000"}
-    r = client.put("/admin/providers/local", json={**base, "api_key": "sk-secret-1"})
-    assert r.status_code == 200
+    _activate_provider_canvas(client, base["base_url"])
+    r = put_with_confirmation(
+        client, "/admin/providers/local", {**base, "api_key": "sk-secret-1"})
+    assert r.status_code == 200, r.text
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert "sk-secret-1" not in r.text
-    assert app.state.snapshot.backends["qwen3-8b"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers["Authorization"] == \
         "Bearer sk-secret-1"
 
     # omitted -> kept
-    r = client.put("/admin/providers/local", json=base)
+    r = put_with_confirmation(client, "/admin/providers/local", base)
+    assert r.status_code == 200, r.text
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert client.get("/admin/providers").text.count("sk-secret-1") == 0
-    assert app.state.snapshot.backends["qwen3-8b"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers["Authorization"] == \
         "Bearer sk-secret-1"
 
     # "" -> cleared
-    r = client.put("/admin/providers/local", json={**base, "api_key": ""})
+    r = put_with_confirmation(
+        client, "/admin/providers/local", {**base, "api_key": ""})
+    assert r.status_code == 200, r.text
     provider = r.json()["provider"]
     assert provider["key_present"] is False
     assert provider["key_source"] == "none"
-    assert "Authorization" not in app.state.snapshot.backends["qwen3-8b"].headers
+    assert "Authorization" not in app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers
 
 
 def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
@@ -377,17 +526,21 @@ def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
     assert client.post("/admin/models", json={
         "id": "env-model", "upstream": "u",
         "provider": "envprov"}).status_code == 201
-    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
+    _activate_provider_canvas(client, "http://e/v1", model="env-model",
+                              provider="envprov", key_env="SR_TEST_KEY")
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
     # a stored key wins over the environment (contract §5.3)
-    client.put("/admin/providers/envprov", json={
+    stored = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": "stored-secret"})
-    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
+    assert stored.status_code == 200, stored.text
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer stored-secret"
     # clearing the stored key falls back to the env
-    client.put("/admin/providers/envprov", json={
+    cleared = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": ""})
-    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
+    assert cleared.status_code == 200, cleared.text
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
 
 
@@ -520,7 +673,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
     conn.close()
     # a missing provider and an illegal declaration must both be tolerated
     app = make_app(tmp_path)
-    assert app.state.snapshot.backends == {}
+    assert app.state.snapshot_set.snapshots == {}
     client = TestClient(app)
     models = {m["id"]: m for m in client.get("/admin/models").json()["models"]}
     assert models["qwen3-8b"]["reasoning"]["declared"] is False
@@ -528,7 +681,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# model writes are judged against the PROSPECTIVE catalog
+# model writes are judged against the ACTIVE graph's embedded runtime config
 # --------------------------------------------------------------------------- #
 def _reasoning_tree_root(level="high"):
     return _direct_graph((("qwen3-8b", level),), node_id="reasoning-target",
@@ -536,69 +689,96 @@ def _reasoning_tree_root(level="high"):
 
 
 def _declare_high(client):
-    r = client.put("/admin/models/qwen3-8b", json={"profile": OPENAI_REASONING})
+    r = put_with_confirmation(
+        client, "/admin/models/qwen3-8b", {"profile": OPENAI_REASONING})
     assert r.status_code == 200, r.text
 
 
-def _declare_low_only(client):
-    """A declaration that no longer declares the tree's 'high' level."""
-    return client.put("/admin/models/qwen3-8b", json={"profile": {
-        "reasoning": {"efforts": {"off": None, "low": "low"},
-                      "default": "low"}}})
+LOW_ONLY_REASONING = {"reasoning": {
+    "efforts": {"off": None, "low": "low"}, "default": "low"}}
 
 
 def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
+    root = _reasoning_tree_root()
+    runtime = _tree_runtime(root, model_overrides={"qwen3-8b": OPENAI_REASONING})
     created = client.post("/admin/trees", json={
-        "id": tree_id, "name": "Reasoning", "root": _reasoning_tree_root()})
+        "id": tree_id, "name": "Reasoning", "root": root, **runtime})
     assert created.status_code == 201, created.text
     enabled = client.post(f"/admin/trees/{tree_id}/enable")
     assert enabled.status_code == 200, enabled.text
     return created.json()["tree"]
 
 
-def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
-    """The health check must judge the write with the PROSPECTIVE rows.
+def test_model_write_previews_then_validates_a_closed_draft_canvas(client, app):
+    """目录写不再以「活动图许可」为门槛，而是对所有受影响画布（含草稿）两阶段。
 
-    Removing a level the ACTIVE tree references is rejected instead of being
-    accepted, so the next startup can always boot.
+    旧契约下关闭的草稿不参与目录写校验；严格自包含画布把「数据库目录能否改写
+    画布」变成显式确认：未确认 409 且零写入，确认后同步草稿的运行时模型项；
+    若同步会让草稿的 target 推理档位失效，候选校验返回 422 并整体回滚。
     """
     _declare_high(client)
-    _activate_reasoning_tree(client)
-    before = {m["id"]: m["profile"] for m in
-              client.get("/admin/models").json()["models"]}
-
-    r = _declare_low_only(client)
-    assert r.status_code == 422, r.text
-    issues = r.json()["detail"]
-    assert any(issue["code"] == "reasoning_unsupported"
-               and issue["node_id"] == "reasoning-target" for issue in issues), issues
-    after = {m["id"]: m["profile"] for m in
-             client.get("/admin/models").json()["models"]}
-    assert after["qwen3-8b"] == before["qwen3-8b"]   # rejected write, DB intact
-
-
-def test_model_write_ignores_reasoning_of_a_closed_tree(client):
-    """Only the ACTIVE tree gates model writes: a closed draft does not, and
-    disabling the active tree lifts the constraint again."""
-    _declare_high(client)
+    root = _reasoning_tree_root()
+    runtime = _tree_runtime(root, model_overrides={"qwen3-8b": OPENAI_REASONING})
     created = client.post("/admin/trees", json={
-        "id": "draft-tree", "name": "Draft",
-        "root": _reasoning_tree_root()})
+        "id": "draft-tree", "name": "Draft", "root": root, **runtime})
     assert created.status_code == 201, created.text
-    # No ACTIVE tree: the write cannot break the hot path or the next boot.
-    assert _declare_low_only(client).status_code == 200
+    graph_dir = Path(app.state.settings.graph_dir, "graphs")
 
-    # Same write against a formerly-active but now DISABLED tree is accepted.
-    _declare_high(client)
-    _activate_reasoning_tree(client, tree_id="disabled-tree")
-    assert client.post("/admin/trees/disabled-tree/disable").status_code == 200
-    assert _declare_low_only(client).status_code == 200
+    def canvas_files():
+        return {path.name: path.read_bytes() for path in graph_dir.glob("*.json")}
+
+    def stored_profile():
+        conn = connect(app.state.settings.db_path)
+        try:
+            return json.loads(conn.execute(
+                "SELECT profile FROM models WHERE id = 'qwen3-8b'").fetchone()[0])
+        finally:
+            conn.close()
+
+    before_files = canvas_files()
+    preview = client.put(
+        "/admin/models/qwen3-8b", json={"upstream": "edited-upstream"})
+
+    assert preview.status_code == 409, preview.text
+    detail = preview.json()["detail"]
+    assert [item["id"] for item in detail["affected_trees"]] == ["draft-tree"]
+    assert detail["affected_trees"][0]["enabled"] is False
+    assert stored_profile() == OPENAI_REASONING
+    assert canvas_files() == before_files
+
+    confirmed = client.put("/admin/models/qwen3-8b", json={
+        "upstream": "edited-upstream",
+        "impact_confirmation": _confirmation_from(preview),
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["synced_trees"] == ["draft-tree"]
+    draft = app.state.graph_repo.get("draft-tree")
+    assert draft.enabled is False
+    assert draft.runtime.backends.models[0]["upstream"] == "edited-upstream"
+    assert draft.runtime.backends.models[0]["profile"] == OPENAI_REASONING
+
+    # 让草稿 target 的 high 档位失效的 profile 更新：确认后候选校验 422 并回滚。
+    before_files = canvas_files()
+    before_profile = stored_profile()
+    preview = client.put(
+        "/admin/models/qwen3-8b", json={"profile": LOW_ONLY_REASONING})
+    assert preview.status_code == 409, preview.text
+    rejected = client.put("/admin/models/qwen3-8b", json={
+        "profile": LOW_ONLY_REASONING,
+        "impact_confirmation": _confirmation_from(preview),
+    })
+
+    assert rejected.status_code == 422, rejected.text
+    assert any(issue["code"] == "reasoning_unsupported"
+               for issue in rejected.json()["detail"])
+    assert stored_profile() == before_profile
+    assert canvas_files() == before_files
 
 
 def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
     _declare_high(client)
     _activate_reasoning_tree(client)
-    r = client.put("/admin/models/qwen3-8b", json={"profile": {
+    r = put_with_confirmation(client, "/admin/models/qwen3-8b", {"profile": {
         "reasoning": {"efforts": {"off": None, "high": "high"},
                       "default": "high"}}})
     assert r.status_code == 200, r.text
@@ -609,102 +789,30 @@ def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
         "off", "high"]
 
 
-def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
-    """The old bug: the write was accepted but the next boot refused.  After
-    the 422 the SAME database must still boot with its active reasoning tree."""
-    app = make_app(tmp_path)
-    client = TestClient(app)
-    _declare_high(client)
-    _activate_reasoning_tree(client)
-    assert _declare_low_only(client).status_code == 422
-
-    restarted = make_app(tmp_path)           # create_app on the same DB file
-    assert restarted.state.snapshot.tree_id == "reasoning-tree"
-
-
-# --------------------------------------------------------------------------- #
-# 服务层回滚契约：校验失败必须同时保住 DB、审计与快照
-# --------------------------------------------------------------------------- #
 def test_model_update_rolls_back_when_active_graph_becomes_invalid(client, app):
     """非法提供方写入返回 422，快照不得被替换。"""
-    before = app.state.snapshot.snapshot_revision
+    before = app.state.snapshot_set.snapshot_revision
     response = client.put("/admin/models/qwen3-8b", json={"provider": "missing-provider"})
     assert response.status_code == 422
-    assert app.state.snapshot.snapshot_revision == before
-
-
-def test_rejected_reasoning_write_keeps_snapshot_revision_and_audit_clean(app, client):
-    """服务层写用例同型：in-tx 校验失败 → 数据库/审计/候选发布三者皆未发生。
-
-    与 tests/test_jev_admin 的失败保存契约一致，这里覆盖模型写用例。"""
-    _declare_high(client)
-    _activate_reasoning_tree(client)
-    changes = {row["detail"]["action"] for row in
-               client.get("/admin/changes").json()["changes"]}
-    before_revision = app.state.snapshot.snapshot_revision
-
-    response = _declare_low_only(client)
-
-    assert response.status_code == 422, response.text
-    assert {row["detail"]["action"] for row in
-            client.get("/admin/changes").json()["changes"]} == changes
-    assert app.state.snapshot.snapshot_revision == before_revision
-
-
-def test_failed_provider_upsert_changes_neither_row_nor_snapshot(tmp_path):
-    """提供方写用例的同一契约：启用校验失败 → 数据库行/审计/快照都不得变化。
-
-    自包含 JSON 生效后「只删数据库 model 行」不再制造无效前提（配置写前会从活动
-    JSON 恢复目录）。这里改用真正的旧图数据库回退：活动图没有内嵌运行配置，外部
-    删除它引用的模型后，提供方写必须 422，且 DB/审计/快照不变、图文件不被写坏。
-    """
-    settings = test_settings(tmp_path, db_path=str(tmp_path / "t.db"))
-    client = TestClient(make_app(tmp_path))
-    _declare_high(client)                       # 先在数据库里声明 high
-    repo = RoutingTreeRepo(settings.graph_dir)
-    repo.create(tree_from_dict(tree_dict("reasoning-tree", root=_reasoning_tree_root())))
-    repo.enable("reasoning-tree")               # 旧图：文件里没有运行配置
-
-    app = make_app(tmp_path)                    # 重启：活动图走数据库回退
-    client = TestClient(app)
-    conn = connect(app.state.settings.db_path)
-    try:
-        conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
-        conn.commit()
-        base_url_before = dict(
-            conn.execute("SELECT * FROM providers WHERE name = 'local'").fetchone())["base_url"]
-    finally:
-        conn.close()
-    before_revision = app.state.snapshot.snapshot_revision
-
-    response = client.put("/admin/providers/local", json={"base_url": "http://x/v1"})
-
-    assert response.status_code == 422, response.text
-    issue_codes = {issue["code"] for issue in response.json()["detail"]}
-    assert "unknown_model" in issue_codes
-    conn = connect(app.state.settings.db_path)
-    try:
-        row = dict(conn.execute("SELECT * FROM providers WHERE name = 'local'").fetchone())
-        audit = conn.execute(
-            "SELECT COUNT(*) FROM changes WHERE kind = 'provider'").fetchone()[0]
-    finally:
-        conn.close()
-    assert row["base_url"] == base_url_before
-    assert audit == 0
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before
 
 
 def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     """删除被引用模型 → 409，且该用例不产生审计行、不改变快照 revision。"""
+    root = _direct_graph((("qwen3-8b", None),))
     assert client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref",
-        "root": _direct_graph((("qwen3-8b", None),))}).status_code == 201
-    before_revision = app.state.snapshot.snapshot_revision
+        "id": "ref-tree", "name": "Ref", "root": root,
+        **_tree_runtime(root)}).status_code == 201
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     response = client.delete("/admin/models/qwen3-8b")
 
     assert response.status_code == 409
-    assert response.json()["detail"]["message"] == "model qwen3-8b 被路由树引用"
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required"
+    assert [item["id"] for item in detail["affected_trees"]] == ["ref-tree"]
+    assert detail["affected_trees"][0]["usage"] == {
+        "targets": ["direct"], "runtime_catalog": True}
     conn = connect(app.state.settings.db_path)
     try:
         audit = conn.execute(
@@ -712,7 +820,7 @@ def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     finally:
         conn.close()
     assert audit == 0
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
 
 @pytest.mark.parametrize(("method", "path", "payload"), [
@@ -733,66 +841,125 @@ def test_model_and_provider_dtos_reject_unknown_fields(client, method, path, pay
 
 
 # --------------------------------------------------------------------------- #
-# delete-model: the reference check and the delete share the publish lock
-# (the scan lives in the ConfigurationService write path)
+# 确认后的目录写：预览是纯读（不占写锁），提交在 publish 写锁内原子完成
 # --------------------------------------------------------------------------- #
-def _instrument_delete_lock(app, client, monkeypatch):
-    """Record whether ``model_references`` is called while the lock is held."""
-    from router.control import config as control_config
-
+def _instrument_publish_lock(app, monkeypatch):
+    """记录 publish 写锁的进入/退出顺序。"""
     publisher = app.state.publisher
     real_locked = publisher.locked
     trace: list[str] = []
-    state = {"inside": False}
 
     @contextmanager
     def recording_locked():
-        state["inside"] = True
         trace.append("lock-enter")
         try:
             with real_locked():
                 yield publisher
         finally:
-            state["inside"] = False
             trace.append("lock-exit")
 
     monkeypatch.setattr(publisher, "locked", recording_locked)
-
-    real_references = control_config.model_references
-
-    def recording_references(trees, model_id):
-        trace.append("check")
-        assert state["inside"], "reference check must run inside the publish lock"
-        return real_references(trees, model_id)
-
-    monkeypatch.setattr(control_config, "model_references", recording_references)
     return trace
 
 
-def test_delete_model_checks_references_inside_the_publish_lock(
+def test_delete_referenced_model_previews_without_lock_then_commits_under_lock(
         app, client, monkeypatch):
+    root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref",
-        "root": _direct_graph((("qwen3-8b", None),))})
+        "id": "ref-tree", "name": "Ref", "root": root, **_tree_runtime(root)})
     assert created.status_code == 201, created.text
-    trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
+    trace = _instrument_publish_lock(app, monkeypatch)
 
-    response = client.delete("/admin/models/qwen3-8b")
+    preview = client.delete("/admin/models/qwen3-8b")
 
-    assert response.status_code == 409
-    assert trace == ["lock-enter", "check", "lock-exit"]
+    assert preview.status_code == 409
+    # 预览只扫描影响清单，不拿写锁（零写入的纯读阶段）。
+    assert trace == []
+
+    confirmed = client.request("DELETE", "/admin/models/qwen3-8b", json={
+        "replacement_model_id": "qwen3-32b",
+        "impact_confirmation": _confirmation_from(preview),
+    })
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert trace == ["lock-enter", "lock-exit"]
+    assert confirmed.json()["synced_trees"] == ["ref-tree"]
 
 
-def test_delete_free_model_also_checks_inside_the_publish_lock(
+def test_delete_free_model_commits_catalog_write_under_the_publish_lock(
         app, client, monkeypatch):
-    trace = _instrument_delete_lock(app, client, monkeypatch)
+    trace = _instrument_publish_lock(app, monkeypatch)
 
     response = client.delete("/admin/models/qwen3-32b")
 
     assert response.status_code == 200, response.text
-    assert trace[0] == "lock-enter"
-    assert "check" in trace
+    assert response.json()["synced_trees"] == []
+    # 无候选画布时仍走单写锁 + 单事务的目录写骨架。
+    assert trace == ["lock-enter", "lock-exit"]
+
+
+def test_provider_delete_rechecks_references_under_the_publish_lock(
+        app, client, monkeypatch):
+    """provider 删除的引用检查必须在写锁内、事务内重算（CRITICAL 2）。
+
+    路由层扫描之后、加锁之前新建一幅引用该 provider 的画布：锁内 recheck 必须
+    返回 409 ``provider_referenced``，provider 行/审计/画布文件都不变；trace 同时
+    证明第二次「DB 模型引用检查」发生在 lock-enter 之后。
+    """
+    assert client.put("/admin/providers/race-prov", json={
+        "base_url": "http://race.test/v1"}).status_code == 200
+    before_providers = {
+        p["name"]: p for p in client.get("/admin/providers").json()["providers"]}
+    before_changes = len(client.get("/admin/changes").json()["changes"])
+
+    trace = _instrument_publish_lock(app, monkeypatch)
+    real_impacts = routes_models.provider_impacts
+    real_db_refs = routes_models.model_ids_using_provider
+    raced = {"done": False}
+
+    def racing_impacts(trees, name):
+        impacts = real_impacts(trees, name)   # 旧清单：race-canvas 还不存在
+        if not raced["done"]:
+            raced["done"] = True
+            root = _direct_graph((("qwen3-8b", None),))
+            runtime = _tree_runtime(root)
+            runtime["backends"]["providers"].append({
+                "name": "race-prov", "base_url": "http://race.test/v1",
+                "key_env": "", "reasoning_format": "openai"})
+            runtime["backends"]["models"][0]["provider"] = "race-prov"
+            app.state.graph_repo.create(tree_from_dict({
+                "id": "race-canvas", "name": "Race", "root": root,
+                "timezone": "Asia/Shanghai",
+                "sticky": {"enabled": False, "ttl_seconds": 1800},
+                **runtime,
+            }))
+        return impacts
+
+    def traced_db_refs(conn, name):
+        trace.append("db-ref-check")
+        return real_db_refs(conn, name)
+
+    monkeypatch.setattr(routes_models, "provider_impacts", racing_impacts)
+    monkeypatch.setattr(routes_models, "model_ids_using_provider", traced_db_refs)
+
+    response = client.delete("/admin/providers/race-prov")
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "provider_referenced"
+    assert detail["models"] == []            # 数据库里没有模型引用它
+    assert [item["id"] for item in detail["affected_trees"]] == ["race-canvas"]
+    # 路由层检查在锁外；锁内 recheck 的 DB 引用检查发生在 lock-enter 之后。
+    assert trace[:2] == ["db-ref-check", "lock-enter"]
     assert trace[-1] == "lock-exit"
+    assert trace.count("db-ref-check") == 2
+    assert "db-ref-check" in trace[2:]
+    # 409 在 db_write 之前抛出：provider 行、审计、新画布都保持原值。
+    assert {
+        p["name"]: p for p in client.get("/admin/providers").json()["providers"]
+    } == before_providers
+    assert len(client.get("/admin/changes").json()["changes"]) == before_changes
+    assert app.state.graph_repo.get("race-canvas") is not None
 
 
 def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
@@ -802,29 +969,45 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     document = portable_tree_dict("portable")
-    repo.create(tree_from_dict(document))
-    repo.enable(document["id"])
+    repo.create(tree_from_dict({**document, "enabled": True, "default": True}))
     conn = connect(settings.db_path)
     try:
         ProviderRepo(conn).upsert(
             "local", "http://json-only.test/v1", api_key="sk-json-secret")
+        # 目录写仍用数据库上下文校验活动画布：目录需登记画布引用的模型。
+        ModelRepo(conn).create("fast", "json-upstream", "local", "{}")
     finally:
         conn.close()
 
     app = make_app(tmp_path)
-    assert app.state.snapshot.backends["fast"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"] == \
         "Bearer sk-json-secret"
     client = TestClient(app)
-    response = client.put("/admin/providers/local",
-                          json={"base_url": "http://new-upstream.test/v1"})
+    preview = client.put(
+        "/admin/providers/local", json={"base_url": "http://new-upstream.test/v1"})
+    assert preview.status_code == 409, preview.text
+    # 未确认：画布与快照都不变。
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
+        "http://json-only.test/v1/chat/completions"
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"] == \
+        "Bearer sk-json-secret"
+
+    response = client.put("/admin/providers/local", json={
+        "base_url": "http://new-upstream.test/v1",
+        "impact_confirmation": _confirmation_from(preview),
+    })
 
     assert response.status_code == 200, response.text
-    backend = app.state.snapshot.backends["fast"]
+    # 确认后画布运行时 provider 同步到新端点；请求省略 api_key 且端点变更 →
+    # 旧密钥不再注入（DB 行被清空），快照改用新端点。
+    backend = app.state.snapshot_set.default_snapshot.backends["fast"]
     assert backend.url == "http://new-upstream.test/v1/chat/completions"
     assert "Authorization" not in backend.headers
     conn = connect(app.state.settings.db_path)
     try:
-        assert ProviderRepo(conn).get("local")["api_key"] == ""
+        row = ProviderRepo(conn).get("local")
+        assert row["base_url"] == "http://new-upstream.test/v1"
+        assert row["api_key"] == ""
     finally:
         conn.close()
 
@@ -839,7 +1022,7 @@ SECRET_KEY_SPELLINGS = ["api_key", "API-KEY", "authorization", "key_present", "k
 def test_model_writes_reject_nested_profile_secrets(client, app, key):
     """模型 POST/PUT 收到嵌套密钥 → 422，且数据库/审计/快照/图文件都不变。"""
     profile = {"metadata": {"labels": [{"tier": "x", key: "review-secret"}]}}
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     conn = connect(app.state.settings.db_path)
     try:
         before_profile = conn.execute(
@@ -869,7 +1052,7 @@ def test_model_writes_reject_nested_profile_secrets(client, app, key):
     assert after_profile == before_profile
     assert after_audit == before_audit
     assert after_models == before_models
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert {path.name: path.read_bytes() for path in graph_dir.glob("*.json")} == before_files
 
 

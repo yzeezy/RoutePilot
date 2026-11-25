@@ -1,39 +1,38 @@
+"""JEV 输入窗口：token 估算/截断、发布骨架指纹复核、路由引擎截断。
+
+窗口现在是 JEV 服务目录行的一部分（``input_tokens``/``context_tokens``），旧独立
+窗口端点与旧图/无活动图的数据库回退读取都已删除；目录语义（多服务各自窗口、
+校验边界）由 ``tests/test_jev_admin.py`` 与 ``tests/test_jev_services.py`` 覆盖。
+本文件保留纯窗口逻辑与发布骨架（``_write_and_publish`` 指纹复核）的回归。
+"""
 import asyncio
 from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
-from router.api.app import create_app
-from router.api.routes_jev import router as jev_router
 from router.control.config import ConfigurationService, _ConfigWriteResult
-from router.control.runtime import sync_db_from_runtime
 from router.jev.client import ChoiceAnswer
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
-    DEFAULT_INPUT_TOKENS,
-    MIN_CONTEXT_TOKENS,
     MIN_INPUT_TOKENS,
     apply_window,
     estimate_tokens,
 )
 from router.routing.graph.compiled import compile_graph
 from router.routing.graph.evaluator import GraphEvaluator
+from router.routing.snapshot import build_snapshot
 from router.routing.tree import tree_from_dict
-from router.routing.snapshot import build_snapshot, read_jev_window
 from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
-from router.store.repositories import SettingsRepo
-from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
+from router.store.routing_trees import GraphChangedDuringLoad
 from router.upstream.catalog import Backend
-from tests.routing_fixtures import portable_tree_dict, test_settings, tree_dict
-
+from tests.routing_fixtures import tree_dict
 
 
 # ── window 单元测试 ────────────────────────────────────────────────────
+
 
 def test_estimate_tokens_counts_cjk_as_one_and_ascii_as_quarter():
     assert estimate_tokens("") == 0
@@ -72,56 +71,10 @@ def test_apply_window_floors_below_minimum_budget():
     assert result.tokens_after <= MIN_INPUT_TOKENS
 
 
-# ── snapshot 读取 ──────────────────────────────────────────────────────
-
-def _db(tmp_path):
-    path = str(tmp_path / "win.db")
-    conn = connect(path)
-    migrate(conn)
-    return conn
-
-
-def test_read_jev_window_defaults_and_overrides(tmp_path):
-    conn = _db(tmp_path)
-    try:
-        assert read_jev_window(conn) == (DEFAULT_INPUT_TOKENS, DEFAULT_CONTEXT_TOKENS)
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "8192")
-        repo.set("jev_input_tokens", "2048")
-        conn.commit()
-        assert read_jev_window(conn) == (2048, 8192)
-        repo.set("jev_input_tokens", "99999")       # 超过 context -> 收口
-        conn.commit()
-        assert read_jev_window(conn) == (8192, 8192)
-        repo.set("jev_context_tokens", "not-a-number")  # 非法 -> 回默认；input 收口到默认 context
-        conn.commit()
-        assert read_jev_window(conn) == (DEFAULT_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS)
-        repo.set("jev_context_tokens", "256")           # 低于上下限 -> 收口到 512
-        repo.set("jev_input_tokens", "256")
-        conn.commit()
-        assert read_jev_window(conn) == (MIN_INPUT_TOKENS, MIN_CONTEXT_TOKENS)
-    finally:
-        conn.close()
-
-
-def test_read_jev_window_ignores_garbage(tmp_path):
-    conn = _db(tmp_path)
-    try:
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "abc")
-        repo.set("jev_input_tokens", "-5")
-        conn.commit()
-        input_tokens, context_tokens = read_jev_window(conn)
-        assert context_tokens == DEFAULT_CONTEXT_TOKENS
-        assert input_tokens == MIN_INPUT_TOKENS
-    finally:
-        conn.close()
-
-
-# ── admin API ──────────────────────────────────────────────────────────
+# ── 发布前指纹复核（共享骨架，目录写不再涉及图批次）────────────────────
 
 class Publisher:
-    """SnapshotPublisher 桩：save_window 走 locked/prepare/publish 契约（Task 2）。"""
+    """SnapshotPublisher 桩：验证 locked/prepare/publish 次序与指纹复核契约。"""
 
     def __init__(self):
         self.published = []
@@ -130,87 +83,30 @@ class Publisher:
     def locked(self):
         yield self
 
-    def prepare(self, conn, tree, fingerprint):
-        return SimpleNamespace(tree=tree, fingerprint=fingerprint)
+    def prepare(self, conn, trees, fingerprint):
+        return SimpleNamespace(snapshot_set=trees, fingerprint=fingerprint)
 
     def publish(self, prepared):
         self.published.append(prepared)
 
 
-def make_client(tmp_path):
-    path = str(tmp_path / "api.db")
-    conn = connect(path)
-    migrate(conn)
-    conn.close()
-    app = FastAPI()
-    app.state.settings = SimpleNamespace(db_path=path)
-    app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
-    app.state.graph_repo.initialize()
-    app.state.publisher = Publisher()
-    app.include_router(jev_router, prefix="/admin")
-    return TestClient(app), app, path
+def _default_tree(tree_id="tree-1"):
+    return SimpleNamespace(id=tree_id, default=True, departments=())
 
-
-def test_get_window_returns_defaults(tmp_path):
-    client, _, _ = make_client(tmp_path)
-    body = client.get("/admin/jev/window").json()
-    assert body["context_tokens"] == DEFAULT_CONTEXT_TOKENS
-    assert body["input_tokens"] == DEFAULT_INPUT_TOKENS
-    assert body["defaults"] == {"context_tokens": DEFAULT_CONTEXT_TOKENS, "input_tokens": DEFAULT_INPUT_TOKENS}
-    assert body["min_context_tokens"] == MIN_CONTEXT_TOKENS
-    assert body["min_input_tokens"] == MIN_INPUT_TOKENS
-
-
-def test_put_window_persists_and_publishes_snapshot(tmp_path):
-    client, app, path = make_client(tmp_path)
-    body = client.put("/admin/jev/window", json={"context_tokens": 8192, "input_tokens": 2048}).json()
-    assert (body["context_tokens"], body["input_tokens"]) == (8192, 2048)
-    assert len(app.state.publisher.published) == 1
-    conn = connect(path)
-    try:
-        assert read_jev_window(conn) == (2048, 8192)
-    finally:
-        conn.close()
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"context_tokens": 1024, "input_tokens": 4096},   # 关系不合法
-        {"context_tokens": 256},                           # 低于上下文下限（512）
-        {"context_tokens": 100},                           # 低于下限
-        {"context_tokens": 999999},                        # 超上限
-        {"input_tokens": "abc"},                           # 非整数
-        {"input_tokens": "++1"},                           # 多个符号不能触发未捕获的 ValueError
-        {"context_tokens": "+-1"},                         # 混合符号同上
-        {"input_tokens": "²"},                             # isdigit 接受但 int 不接受
-        {"input_tokens": True},                            # bool 不是整数
-        {"unknown": 1},                                    # 未知字段
-        {"context_tokens": None, "input_tokens": 2048},    # 显式 null 不是"缺省"，必须 422
-    ],
-)
-def test_put_window_rejects_invalid(tmp_path, payload):
-    client, app, _ = make_client(tmp_path)
-    resp = client.put("/admin/jev/window", json=payload)
-    assert resp.status_code == 422, resp.text
-    assert app.state.publisher.published == []
-
-
-# ── 发布前指纹复核（Task 10 FIX 4）────────────────────────────────────
 
 class _Trees:
-    """最小树仓库桩：按队列吐指纹，队列耗尽后停在最后一个。"""
+    """最小树仓库桩：按队列吐路由集指纹，队列耗尽后停在最后一个。"""
 
     def __init__(self, fingerprints):
         self._fingerprints = list(fingerprints)
 
-    def fingerprint(self):
+    def route_fingerprint(self):
         if len(self._fingerprints) > 1:
             return self._fingerprints.pop(0)
         return self._fingerprints[0]
 
-    def active(self):
-        return None
+    def enabled(self):
+        return [_default_tree()]
 
 
 def _fresh_conn(tmp_path):
@@ -225,15 +121,15 @@ def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
     try:
         publisher = Publisher()
         service = ConfigurationService(
-            conn, _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b")]), publisher)
+            conn, _Trees(["sha-a", "sha-b"]), publisher)
 
         def write(_conn):
-            prepared = service._prepared_snapshot()  # 指纹 sha-a
+            prepared = service._prepared_snapshot_set()  # 指纹 sha-a
             return _ConfigWriteResult(prepared, None)
 
         service._write_and_publish(write)
         assert len(publisher.published) == 1
-        assert publisher.published[0].fingerprint == ("tree-1", "sha-b")
+        assert publisher.published[0].fingerprint == "sha-b"
     finally:
         conn.close()
 
@@ -245,51 +141,46 @@ def test_publish_refuses_when_fingerprint_keeps_changing(tmp_path):
         publisher = Publisher()
         service = ConfigurationService(
             conn,
-            _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b"), ("tree-1", "sha-c")]),
+            _Trees(["sha-a", "sha-b", "sha-c"]),
             publisher,
         )
         with pytest.raises(GraphChangedDuringLoad):
             service._write_and_publish(
-                lambda _conn: _ConfigWriteResult(service._prepared_snapshot(), None))
+                lambda _conn: _ConfigWriteResult(service._prepared_snapshot_set(), None))
         assert publisher.published == []
     finally:
         conn.close()
 
 
 class _SwappingTrees:
-    """最小树仓库桩：底层文档在两次读取之间被改写，模拟磁盘竞态。
-
-    真实 ``RoutingTreeRepo.fingerprint()`` 与 ``active()`` 是两次独立读取；
-    这里让文档恰好在这两次读取之间换掉（``swap_after`` 次读取后生效），
-    于是「先读树、后读指纹」会拿到（过期树, 当前指纹）这一自相矛盾的候选。
-    """
+    """最小树仓库桩：底层文档在两次读取之间被改写，模拟磁盘竞态。"""
 
     def __init__(self, before, after, *, swap_after=1):
-        self._document = before              # ((tree_id, sha256), tree)
+        self._document = before              # (route_fingerprint, enabled trees)
         self._after = after
         self._reads = 0
         self._swap_after = swap_after
         self.calls = []
 
     def _read(self, name):
-        fingerprint, tree = self._document
+        fingerprint, trees = self._document
         self.calls.append(name)
         self._reads += 1
         if self._reads >= self._swap_after:
             self._document = self._after
-        return fingerprint, tree
+        return fingerprint, trees
 
-    def fingerprint(self):
-        return self._read("fingerprint")[0]
+    def route_fingerprint(self):
+        return self._read("route_fingerprint")[0]
 
-    def active(self):
-        return self._read("active")[1]
+    def enabled(self):
+        return self._read("enabled")[1]
 
 
 def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
     """指纹必须先于树读取：两次读取之间图变了，绝不能把过期树配当前指纹发布。"""
-    doc_a = (("tree-a", "sha-a"), SimpleNamespace(id="doc-a"))
-    doc_b = (("tree-b", "sha-b"), SimpleNamespace(id="doc-b"))
+    doc_a = ("sha-a", [_default_tree("doc-a")])
+    doc_b = ("sha-b", [_default_tree("doc-b")])
     conn = _fresh_conn(tmp_path)
     try:
         publisher = Publisher()
@@ -297,91 +188,45 @@ def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
         service = ConfigurationService(conn, trees, publisher)
 
         service._write_and_publish(
-            lambda _conn: _ConfigWriteResult(service._prepared_snapshot(), None))
+            lambda _conn: _ConfigWriteResult(service._prepared_snapshot_set(), None))
 
         assert len(publisher.published) == 1
         published = publisher.published[0]
         # 重考发现「树过期、指纹是当前」，用当前文档重建一次；绝不发布
         # (doc-a 的树, doc-b 的指纹) 这种自相矛盾的快照。
-        assert published.tree is doc_b[1]
+        assert published.snapshot_set is doc_b[1]
+        assert published.snapshot_set[0] is doc_b[1][0]
         assert published.fingerprint == doc_b[0]
-        assert trees.calls[:2] == ["fingerprint", "active"]
+        assert trees.calls[:2] == ["route_fingerprint", "enabled"]
     finally:
         conn.close()
 
 
-# ── 真实组合根：写事务回滚契约（与服务层 save_window 同型）──────────────
-
-
-def direct_graph():
-    """start → target(qwen3-8b)：无问题节点，不需要决策服务即可启用。"""
-    return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "direct", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}]},
-        ],
-        "edges": [{
-            "id": "e-start-direct", "source": "start", "source_port": "out",
-            "target": "direct", "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": "direct",
-    }
-
-
-def _window_tree_app(tmp_path):
-    """真实 create_app + 已启用图：enable 校验失败时 DB/审计/快照都不得变化。"""
-    settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
-    repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=direct_graph())))
-    repo.enable("main")
-    app = create_app(settings)
-    return app, TestClient(app)
-
-
-def test_failed_window_save_changes_neither_db_audit_nor_snapshot(tmp_path):
-    app, client = _window_tree_app(tmp_path)
-    conn = connect(app.state.settings.db_path)
+def test_recheck_rebuilds_complete_enabled_set(tmp_path):
+    """指纹不符时的重考必须用完整启用集合重建，绝不回退到默认图/单图。"""
+    doc_a = ("sha-a", [_default_tree("tree-a1"), _default_tree("tree-a2")])
+    doc_b = ("sha-b", [_default_tree("tree-b1"), _default_tree("tree-b2")])
+    conn = _fresh_conn(tmp_path)
     try:
-        conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
-        conn.commit()
+        publisher = Publisher()
+        # 前两次读取（初建候选快照）看到 doc-a，之后磁盘变成 doc-b。
+        trees = _SwappingTrees(doc_a, doc_b, swap_after=2)
+        service = ConfigurationService(conn, trees, publisher)
+
+        service._write_and_publish(
+            lambda _conn: _ConfigWriteResult(
+                service._prepared_snapshot_set(), None))
+
+        assert len(publisher.published) == 1
+        published = publisher.published[0]
+        # 重考重建的是当前完整启用集合（两张图都在），不是单图回退。
+        assert published.snapshot_set is doc_b[1]
+        assert [tree.id for tree in published.snapshot_set] == [
+            "tree-b1", "tree-b2"]
+        assert published.fingerprint == "sha-b"
+        assert trees.calls.count("enabled") == 2
     finally:
         conn.close()
-    before_revision = app.state.snapshot.snapshot_revision
-    before_window = (app.state.snapshot.jev_input_tokens, app.state.snapshot.jev_context_tokens)
-
-    response = client.put("/admin/jev/window", json={"context_tokens": 8192, "input_tokens": 2048})
-
-    assert response.status_code == 422, response.text
-    issue_codes = {issue["code"] for issue in response.json()["detail"]}
-    assert "unknown_model" in issue_codes
-    conn = connect(app.state.settings.db_path)
-    try:
-        assert read_jev_window(conn) == before_window
-        assert conn.execute(
-            "SELECT COUNT(*) FROM changes WHERE kind = 'jev_window'").fetchone()[0] == 0
-    finally:
-        conn.close()
-    assert app.state.snapshot.snapshot_revision == before_revision
-    assert (app.state.snapshot.jev_input_tokens, app.state.snapshot.jev_context_tokens) == before_window
-
-
-def test_put_window_publishes_candidate_snapshot_with_new_values(tmp_path):
-    settings = test_settings(tmp_path)
-    app = create_app(settings)
-    with TestClient(app) as client:
-        before = app.state.snapshot.snapshot_revision
-
-        response = client.put("/admin/jev/window", json={"context_tokens": 8192, "input_tokens": 2048})
-
-        assert response.status_code == 200, response.text
-        assert app.state.snapshot.jev_input_tokens == 2048
-        assert app.state.snapshot.jev_context_tokens == 8192
-        assert app.state.snapshot.snapshot_revision != before
-        body = response.json()
-        assert (body["input_tokens"], body["context_tokens"]) == (2048, 8192)
 
 
 # ── 路由引擎：截断生效 + trace ─────────────────────────────────────────
@@ -449,306 +294,3 @@ def test_evaluator_leaves_short_input_alone():
     assert len(window_events) == 1
     assert window_events[0]["truncated"] is False
     assert window_events[0]["tokens_before"] == window_events[0]["tokens_after"]
-
-
-# ── 自包含 JSON：窗口有效配置来自活动图 runtime（Task B1）───────────────
-def _portable_client(tmp_path):
-    settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
-    repo.initialize()
-    document = portable_tree_dict("portable")
-    repo.create(tree_from_dict(document))
-    repo.enable(document["id"])
-    app = create_app(settings)
-    return app, TestClient(app), settings
-
-
-def test_get_window_prefers_active_json_over_database(tmp_path):
-    app, client, settings = _portable_client(tmp_path)
-    conn = connect(settings.db_path)
-    try:
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "8192")
-        repo.set("jev_input_tokens", "2048")
-        conn.commit()
-    finally:
-        conn.close()
-
-    window = client.get("/admin/jev/window").json()
-
-    assert (window["input_tokens"], window["context_tokens"]) == (1024, 4096)
-    conn = connect(settings.db_path)
-    try:
-        assert read_jev_window(conn) == (2048, 8192)   # GET 不改写管理表
-    finally:
-        conn.close()
-
-
-def test_put_window_inherits_missing_field_from_active_json(tmp_path):
-    """PUT 只给 context 时，input 的当前值来自活动 JSON，而不是数据库旧值。"""
-    app, client, settings = _portable_client(tmp_path)
-    conn = connect(settings.db_path)
-    try:
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "8192")
-        repo.set("jev_input_tokens", "2048")
-        conn.commit()
-    finally:
-        conn.close()
-
-    response = client.put("/admin/jev/window", json={"context_tokens": 8192})
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert (body["input_tokens"], body["context_tokens"]) == (1024, 8192)
-    runtime = app.state.graph_repo.get("portable").runtime
-    assert (runtime.jev_input_tokens, runtime.jev_context_tokens) == (1024, 8192)
-    assert (app.state.snapshot.jev_input_tokens,
-            app.state.snapshot.jev_context_tokens) == (1024, 8192)
-
-
-# ── 全局配置跨图写入：预检、暂存、活动图最后写、异常整体回滚（Task B）──────
-def _two_graph_app(tmp_path):
-    """真实 create_app + 两份自包含图：a 已启用、b 未启用。"""
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app, raise_server_exceptions=False)
-    for tree_id in ("a", "b"):
-        payload = portable_tree_dict(tree_id)
-        payload.pop("enabled")
-        assert client.post("/admin/trees", json=payload).status_code == 201
-    assert client.post("/admin/trees/a/enable").status_code == 200
-    assert (app.state.graph_repo.get("a").runtime.jev_input_tokens,
-            app.state.graph_repo.get("b").runtime.jev_input_tokens) == (1024, 1024)
-    return app, client
-
-
-def _graph_state(repo, tree_ids):
-    """所有图的文件字节 + 仓储指纹（document_sha256），用于整体不变断言。"""
-    return {
-        tree_id: ((repo.graphs / f"{tree_id}.json").read_bytes(),
-                  repo.get(tree_id).document_sha256)
-        for tree_id in tree_ids
-    }
-
-
-def _input_tokens(repo, tree_id):
-    return repo.get(tree_id).runtime.jev_input_tokens
-
-
-def _write_state(app):
-    conn = connect(app.state.settings.db_path)
-    try:
-        return (
-            SettingsRepo(conn).get("jev_input_tokens"),
-            conn.execute(
-                "SELECT COUNT(*) FROM changes WHERE kind = 'jev_window'").fetchone()[0],
-        )
-    finally:
-        conn.close()
-
-
-def test_second_graph_write_failure_rolls_back_every_tree(tmp_path, monkeypatch):
-    """第二份图替换失败：不返回 409/半份结果，所有图恢复原字节，DB/审计/快照不动。"""
-    app, client = _two_graph_app(tmp_path)
-    repo = app.state.graph_repo
-    before_files = _graph_state(repo, ("a", "b"))
-    before_write = _write_state(app)
-    before_revision = app.state.snapshot.snapshot_revision
-
-    original_replace = repo._replace_staged
-    replaced = []
-
-    def fail_second_replace(staged_path, path):
-        replaced.append(path.stem)
-        if len(replaced) == 2:
-            raise OSError("injected second graph failure")
-        original_replace(staged_path, path)
-
-    monkeypatch.setattr(repo, "_replace_staged", fail_second_replace)
-
-    response = client.put("/admin/jev/window", json={"input_tokens": 1030})
-
-    assert response.status_code == 503, response.text
-    assert len(replaced) == 2, "故障必须注入在第二次正式写入时"
-    assert _graph_state(repo, ("a", "b")) == before_files
-    assert _input_tokens(repo, "a") == 1024
-    assert _input_tokens(repo, "b") == 1024
-    assert _write_state(app) == before_write
-    assert app.state.snapshot.snapshot_revision == before_revision
-    assert app.state.snapshot.jev_input_tokens == 1024
-    # 下一次合法写入仍能成功，不需要手工修复任何图。
-    monkeypatch.setattr(repo, "_replace_staged", original_replace)
-    retried = client.put("/admin/jev/window", json={"input_tokens": 1030})
-    assert retried.status_code == 200, retried.text
-    assert _input_tokens(repo, "a") == 1030
-    assert _input_tokens(repo, "b") == 1030
-
-
-def test_preflight_sha_change_conflicts_without_touching_any_tree(tmp_path, monkeypatch):
-    """预检发现非活动图已被外部改写：409，且不替换任何图文件。"""
-    app, client = _two_graph_app(tmp_path)
-    repo = app.state.graph_repo
-    before_a = (repo.graphs / "a.json").read_bytes()
-    before_write = _write_state(app)
-    before_revision = app.state.snapshot.snapshot_revision
-
-    original_stage = repo.stage_updates
-    tampered = {}
-
-    def tamper_b_then_stage(updates):
-        path = repo.graphs / "b.json"
-        path.write_bytes(path.read_bytes() + b"\n")
-        tampered["b"] = path.read_bytes()
-        return original_stage(updates)
-
-    monkeypatch.setattr(repo, "stage_updates", tamper_b_then_stage)
-
-    response = client.put("/admin/jev/window", json={"input_tokens": 1030})
-
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "graph_conflict"
-    assert (repo.graphs / "b.json").read_bytes() == tampered["b"]
-    assert (repo.graphs / "a.json").read_bytes() == before_a
-    assert _input_tokens(repo, "b") == 1024
-    assert _write_state(app) == before_write
-    assert app.state.snapshot.snapshot_revision == before_revision
-
-
-def test_snapshot_prepare_failure_after_graph_commit_restores_bytes(tmp_path, monkeypatch):
-    """图批次已替换、候选快照构造失败：所有图恢复原字节，数据库回滚。"""
-    app, client = _two_graph_app(tmp_path)
-    repo = app.state.graph_repo
-    before_files = _graph_state(repo, ("a", "b"))
-    before_write = _write_state(app)
-    before_revision = app.state.snapshot.snapshot_revision
-    publisher = app.state.publisher
-
-    def boom(*args, **kwargs):
-        raise GraphStorageError("injected snapshot prepare failure")
-
-    monkeypatch.setattr(publisher, "prepare", boom)
-
-    response = client.put("/admin/jev/window", json={"input_tokens": 1030})
-
-    assert response.status_code == 503, response.text
-    assert _graph_state(repo, ("a", "b")) == before_files
-    assert _write_state(app) == before_write
-    assert app.state.snapshot.snapshot_revision == before_revision
-    assert app.state.snapshot.jev_input_tokens == 1024
-
-
-def test_exception_before_transaction_commit_rolls_back_graphs(tmp_path, monkeypatch):
-    """COMMIT 前复核异常：已经替换的图文件必须恢复，DB/审计/快照不动。"""
-    app, client = _two_graph_app(tmp_path)
-    repo = app.state.graph_repo
-    before_files = _graph_state(repo, ("a", "b"))
-    before_write = _write_state(app)
-    before_revision = app.state.snapshot.snapshot_revision
-
-    def boom(self, prepared):
-        raise RuntimeError("injected fingerprint failure")
-
-    monkeypatch.setattr(ConfigurationService, "_recheck_fingerprint", boom)
-
-    response = client.put("/admin/jev/window", json={"input_tokens": 1030})
-
-    assert response.status_code == 500, response.text
-    assert _graph_state(repo, ("a", "b")) == before_files
-    assert _input_tokens(repo, "a") == 1024
-    assert _input_tokens(repo, "b") == 1024
-    assert _write_state(app) == before_write
-    assert app.state.snapshot.snapshot_revision == before_revision
-
-
-def test_successful_window_save_writes_all_graphs_and_publishes_once(tmp_path, monkeypatch):
-    """成功路径：两份图都写新窗口、恰好发布一次、文件里没有密钥字段。"""
-    app, client = _two_graph_app(tmp_path)
-    repo = app.state.graph_repo
-    published = []
-    real_publish = app.state.publisher.publish
-
-    def counting_publish(prepared):
-        published.append(prepared)
-        return real_publish(prepared)
-
-    monkeypatch.setattr(app.state.publisher, "publish", counting_publish)
-
-    response = client.put("/admin/jev/window", json={"input_tokens": 1030})
-
-    assert response.status_code == 200, response.text
-    assert len(published) == 1
-    assert _input_tokens(repo, "a") == 1030
-    assert _input_tokens(repo, "b") == 1030
-    for tree_id in ("a", "b"):
-        content = (repo.graphs / f"{tree_id}.json").read_bytes()
-        assert b'"api_key"' not in content
-        assert b"key_present" not in content
-    assert app.state.snapshot.jev_input_tokens == 1030
-
-
-# ── 二审缺陷 1：批次所有权上移，回滚与快照刷新必须在事务退出之后（Task 1）──
-def _legacy_active_two_graph_app(tmp_path):
-    """旧活动图 a（文件无内嵌配置）+ 自包含非活动图 b。
-
-    直接用仓储建图，避免管理 API 自动物化旧图；再用数据库目录支撑 a 的启用校验。
-    """
-    app = create_app(test_settings(tmp_path))
-    repo = app.state.graph_repo
-    legacy = portable_tree_dict("a")
-    for field in ("backends", "jev", "jev_window", "time_periods"):
-        legacy.pop(field)
-    repo.create(tree_from_dict(legacy))
-    repo.create(tree_from_dict(portable_tree_dict("b")))
-
-    conn = connect(app.state.settings.db_path)
-    try:
-        with conn:
-            sync_db_from_runtime(conn, repo.get("b").runtime)
-        repo.enable("a")
-        app.state.publisher.refresh(conn)
-    finally:
-        conn.close()
-    return app, TestClient(app, raise_server_exceptions=False), repo
-
-
-def test_rollback_failure_refreshes_only_after_database_rollback(tmp_path, monkeypatch):
-    """B 回滚失败时，刷新快照不得读取未回滚事务：DB/活动图/快照都必须回到 1024。"""
-    app, client, repo = _legacy_active_two_graph_app(tmp_path)
-    before_files = _graph_state(repo, ("a", "b"))
-    before_write = _write_state(app)
-    before_revision = app.state.snapshot.snapshot_revision
-
-    original_replace = repo._replace_staged
-    replaced = []
-
-    def fail_second_replace(staged_path, path):
-        replaced.append(path.stem)
-        if len(replaced) == 2:
-            raise OSError("injected active graph failure")
-        original_replace(staged_path, path)
-
-    def fail_rollback(path, content):
-        raise OSError("injected rollback failure")
-
-    real_refresh = app.state.publisher.refresh
-    refresh_transaction_states = []
-
-    def checked_refresh(conn):
-        refresh_transaction_states.append(conn.in_transaction)
-        return real_refresh(conn)
-
-    monkeypatch.setattr(repo, "_replace_staged", fail_second_replace)
-    monkeypatch.setattr(repo, "_atomic_write", fail_rollback)
-    monkeypatch.setattr(app.state.publisher, "refresh", checked_refresh)
-
-    response = client.put("/admin/jev/window", json={"input_tokens": 1030})
-
-    assert response.status_code == 503, response.text
-    assert replaced == ["b", "a"], "必须覆盖非活动图已写、活动图替换失败"
-    assert refresh_transaction_states == [False], "快照刷新不得读取未回滚事务"
-    assert _write_state(app) == before_write
-    assert (repo.graphs / "a.json").read_bytes() == before_files["a"][0]
-    assert repo.get("a").runtime is None
-    assert _input_tokens(repo, "b") == 1030, "故障注入必须确实让 B 回滚失败"
-    assert app.state.snapshot.jev_input_tokens == 1024
-    assert app.state.snapshot.snapshot_revision == before_revision

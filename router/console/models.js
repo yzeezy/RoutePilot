@@ -2,18 +2,24 @@
    the remote JEV service summary. Model profile.capability is the text source
    for single-model JEV targets in routing.html.
 
-   Modal #modelModal has two add paths:
-     - preset: pick a catalog provider, optional API key, tick preset models,
-       optionally rename their model slots (default = upstream id)
-     - custom: define a model slot by hand, wire a provider (existing or inline
+   "Connect models" (#addModel) is the single onboarding entry; #modelModal has
+   two paths:
+     - preset: pick a catalog provider, optional API key, tick preset models.
+       Base URL / env auth and each model slot sit in collapsed advanced
+       sections (slot default = normalized upstream id)
+     - custom: enter the upstream id; a blank slot id is derived from it on
+       save (sanitizeSlot + uniqueSlot), wire a provider (existing or inline
        new), declare its reasoning capability (profile.reasoning) and profile
-   Modal #provModal edits one provider (catalog prefill, api_key three-state).
+   There is no standalone add-provider button: connecting a model creates the
+   provider, and #provModal edits one from its card (catalog prefill, api_key
+   three-state).
 
    Contract: docs/模型目录与推理配置-2026-10-21.md §5/§7. Old backends without
    /admin/model-catalog or without model.reasoning degrade gracefully (catalog
    notice, "未声明" badges) instead of throwing. */
 import { api, esc, toast } from './api.js';
 import { LANG, onLangChange, t, tf } from './i18n.js';
+import { withImpactConfirmation } from './impact.js';
 import './nav.js';
 
 const $ = s => document.querySelector(s);
@@ -47,7 +53,7 @@ function uniqueSlot(base, taken) {
 
 /* ── state ───────────────────────────────────────────────────────────── */
 const STATE = {
-  models: [], providers: [], jev: {},
+  models: [], providers: [], jev: [],
   catalog: null,            // GET /admin/model-catalog, null when unavailable
   formats: [],              // [{id, zh, en}]
 };
@@ -178,27 +184,59 @@ function modalMsg(which, text, bad) {
   el.classList.toggle('ok', !!text && !bad);
 }
 
-/* Two-step inline delete: 删除 -> 确认删除 (3s) -> delete. */
-function armDelete(btn) {
-  if (btn.dataset.armed === '1') return true;
-  btn.dataset.armed = '1';
-  btn.dataset.label = btn.textContent;
-  btn.textContent = t('models.confirmDelete');
-  btn.classList.add('armed');
-  setTimeout(() => {
-    if (!btn.isConnected) return;
-    btn.dataset.armed = '0';
-    btn.textContent = btn.dataset.label || t('models.delete');
-    btn.classList.remove('armed');
-  }, 3000);
+/* 影响确认成功的提示素材：服务端会改写受影响画布的 runtime 快照，已打开的画布
+   不会自动重载。同步数量必须和操作本身的提示**合并成一条** toast —— 两条 toast
+   在同一固定位置会互相覆盖，后一条会把「已同步 N 个画布 / 请重新加载」遮掉。 */
+function syncedCount(result) {
+  const synced = result && Array.isArray(result.synced_trees) ? result.synced_trees : [];
+  return synced.length;
+}
+function syncedSuffix(count) {
+  return count > 0 ? ' · ' + tf('impact.synced', { n: count }) : '';
+}
+/* 影响确认的取消 / 陈旧结果：陈旧哈希必须重新读取目录与影响清单，绝不盲目重试。
+   返回 false 表示这次写没有成功（取消 / 陈旧 / 不可绕过），调用方停止后续 UI。 */
+async function settleImpact(outcome) {
+  if (!outcome || outcome.ok) return true;
+  if (outcome.conflict) {
+    toast(t('impact.conflictToast'), 4600);
+    await boot();
+  }
   return false;
 }
+/* 删除 / 编辑预览的在途保护：确认框还在打开时重复点击不能再发一次写请求 ——
+   第二次 openImpact 会覆盖第一个 settle，让第一个 Promise 永远 pending。 */
+let impactPreviewBusy = false;
+function beginImpactPreview() {
+  if (impactPreviewBusy) return false;
+  impactPreviewBusy = true;
+  return true;
+}
+function endImpactPreview() { impactPreviewBusy = false; }
 
-/* header pill only; the JEV summary card lives on jev.html now */
-function renderEngine(config) {
-  config = config || {};
+/* header pill only; the JEV summary (services list) lives on jev.html now.
+   旧单配置形态 `{config}` 已被多服务 `{services:[...]}` 取代，这里显示服务数 /
+   第一个服务的 id + model；目录为空时必须显示“无服务”而不是空白。 */
+function renderEngine(services) {
+  const list = Array.isArray(services) ? services.filter(service => service && service.id) : [];
   const pill = $('#enginePill');
-  if (pill) pill.innerHTML = `<span class="dot" style="color:var(--indigo)"></span>JEV <b>${esc(config.model || '—')}</b>`;
+  if (!pill) return;
+  pill.textContent = '';
+  const dot = document.createElement('span');
+  dot.className = 'dot';
+  dot.style.color = 'var(--indigo)';
+  pill.append(dot, document.createTextNode('JEV '));
+  const bold = document.createElement('b');
+  if (!list.length) {
+    bold.textContent = t('models.jevNone');
+    pill.append(bold);
+    return;
+  }
+  const first = list[0];
+  bold.textContent = String(list.length);
+  pill.append(bold);
+  const label = first.model ? `${first.id} / ${first.model}` : String(first.id);
+  pill.append(document.createTextNode(' · ' + label));
 }
 
 /* ── model registry ──────────────────────────────────────────────────── */
@@ -235,12 +273,25 @@ function renderModels() {
 }
 
 async function deleteModel(id) {
+  if (!beginImpactPreview()) return;
   try {
-    await api.req('DELETE', `/admin/models/${encodeURIComponent(id)}`);
-    toast(t('models.deleted') + ' · ' + id);
+    /* 第一次 DELETE 原样发出：被画布引用时服务端只回 409 影响预览，确认框里
+       取消不产生任何写请求；需要替代项时确认前必须先选择。 */
+    const outcome = await withImpactConfirmation(context => {
+      const path = `/admin/models/${encodeURIComponent(id)}`;
+      if (!context) return api.req('DELETE', path);
+      return api.req('DELETE', path, {
+        impact_confirmation: context.impact_confirmation,
+        replacement_model_id: context.replacement_id,
+      });
+    }, { operation: 'delete' });
+    if (!(await settleImpact(outcome))) return;
+    toast(t('models.deleted') + ' · ' + id + syncedSuffix(syncedCount(outcome.result)));
     await boot();
   } catch (e) {
-    toast(t('models.deleteRef') + ' · ' + errText(e), 3600);
+    toast(tf('models.deleteFail', { err: errText(e) }), 3600);
+  } finally {
+    endImpactPreview();
   }
 }
 
@@ -277,13 +328,29 @@ function renderProviders() {
 }
 
 async function deleteProvider(name) {
+  if (!beginImpactPreview()) return;
   try {
-    await api.req('DELETE', `/admin/providers/${encodeURIComponent(name)}`);
+    /* provider 删除不可绕过：引用存在时服务端始终 409 `provider_referenced`；
+       共享确认框只展示不可绕过的引用清单（数据库模型 + 受影响画布）。 */
+    const outcome = await withImpactConfirmation(() =>
+      api.req('DELETE', `/admin/providers/${encodeURIComponent(name)}`));
+    if (!(await settleImpact(outcome))) return;
     toast(t('models.deleted') + ' · ' + name);
     await boot();
   } catch (e) {
-    toast(t('models.prov.ref') + ' · ' + errText(e), 3600);
+    toast(tf('models.prov.deleteFail', { err: errText(e) }), 3600);
+  } finally {
+    endImpactPreview();
   }
+}
+
+/* provider 写入（upsert）：已有 provider 出现在画布运行目录里时同样走两阶段
+   确认；新 provider 不可能被引用，服务端直接返回成功。 */
+async function putProvider(name, body) {
+  const path = `/admin/providers/${encodeURIComponent(name)}`;
+  return withImpactConfirmation(context => context
+    ? api.put(path, { ...body, impact_confirmation: context.impact_confirmation })
+    : api.put(path, body));
 }
 
 /* ══ model modal: preset tab ══════════════════════════════════════════ */
@@ -333,26 +400,37 @@ function presetBody() {
           <span class="pm-up mono">${esc(m.id)}</span>${ctx}
           ${reasonChips(m.reasoning || (m.profile && m.profile.reasoning))}
         </label>
-        <div class="pm-idslot" data-slot="${esc(m.id)}"${checked ? '' : ' hidden'}>
-          <label class="field"><span>${esc(t('models.preset.slot'))}</span>
-            <input class="pm-id" data-mid="${esc(m.id)}" value="${esc(slot)}"></label>
-          <span class="mut pm-slot-hint">${esc(t('models.preset.slotHint'))}</span>
-          <span class="pm-conflict" data-conflict="${esc(m.id)}" hidden>${esc(t('models.preset.slotConflict'))}</span>
-        </div>
+        <details class="pm-advanced">
+          <summary>${esc(t('models.customizeId'))}</summary>
+          <div class="pm-idslot" data-slot="${esc(m.id)}"${checked ? '' : ' hidden'}>
+            <label class="field"><span>${esc(t('models.preset.slot'))}</span>
+              <input class="pm-id" data-mid="${esc(m.id)}" value="${esc(slot)}"></label>
+            <span class="mut pm-slot-hint">${esc(t('models.preset.slotHint'))}</span>
+            <span class="pm-conflict" data-conflict="${esc(m.id)}" hidden>${esc(t('models.preset.slotConflict'))}</span>
+          </div>
+        </details>
       </div>`;
   }).join('');
+  /* Base URL and the env-auth line are read-only context, so they only show up
+     inside the collapsed advanced block; the default view stays provider →
+     API key → model multi-select. */
+  const baseUrlAndEnvironmentFields = `<label class="field">
+      <span>${esc(t('models.preset.baseurl'))}</span>
+      <input id="pmBase" value="${esc(prov.base_url || '')}" readonly>
+    </label>
+    <div class="keyline">${envLine}</div>`;
+  const advancedConnection = `<details class="adv" id="pmAdvanced">
+      <summary>${esc(t('models.advancedConnection'))}</summary>
+      <div id="pmAdvancedBody">${baseUrlAndEnvironmentFields}</div>
+    </details>`;
   return `
-    <div class="form-grid">
-      <label class="field"><span>${esc(t('models.preset.catalog'))}</span>
-        <select id="pmProvider">${list.map(p =>
-          `<option value="${esc(p.id)}"${p.id === pid ? ' selected' : ''}>${esc(p.name)} · ${esc(p.base_url)}</option>`).join('')}</select></label>
-      <label class="field"><span>${esc(t('models.preset.baseurl'))}</span>
-        <input id="pmBase" value="${esc(prov.base_url || '')}" readonly></label>
-    </div>
-    <div class="keyline">${envLine}</div>
+    <label class="field"><span>${esc(t('models.preset.catalog'))}</span>
+      <select id="pmProvider">${list.map(p =>
+        `<option value="${esc(p.id)}"${p.id === pid ? ' selected' : ''}>${esc(p.name)} · ${esc(p.base_url)}</option>`).join('')}</select></label>
     <label class="field"><span>${esc(t('models.preset.key'))}</span>
       <input id="pmKey" type="password" autocomplete="off" value="${esc(modal.keyValue || '')}"
              placeholder="${esc(tf('models.preset.keyPlaceholder', { env: env || '—' }))}"></label>
+    ${advancedConnection}
     <div class="col-h sm">${esc(t('models.preset.pickModels'))}</div>
     <div class="preset-models" id="pmModels">${modelRows || `<div class="empty">${esc(t('common.none'))}</div>`}</div>`;
 }
@@ -413,18 +491,24 @@ async function savePreset() {
   try {
     const existing = providerOf(pid);
     const key = (modal.keyValue || '').trim();
+    /* provider upsert 可能同步若干画布：同步数量并入最终的一条 toast。 */
+    let synced = 0;
     if (!existing) {
       const body = { base_url: prov.base_url, key_env: prov.key_env || '',
                      reasoning_format: prov.reasoning_format || 'openai' };
       if (key) body.api_key = key;
-      await api.put(`/admin/providers/${encodeURIComponent(pid)}`, body);
+      const providerOutcome = await putProvider(pid, body);
+      if (!(await settleImpact(providerOutcome))) return;
+      synced += syncedCount(providerOutcome.result);
     } else if (key) {
-      await api.put(`/admin/providers/${encodeURIComponent(pid)}`, {
+      const providerOutcome = await putProvider(pid, {
         base_url: existing.base_url,
         key_env: existing.key_env || '',
         reasoning_format: existing.reasoning_format || 'openai',
         api_key: key,
       });
+      if (!(await settleImpact(providerOutcome))) return;
+      synced += syncedCount(providerOutcome.result);
     }
     for (const { upstream, slot } of pairs) {
       const preset = (prov.models || []).find(m => m.id === upstream) || {};
@@ -433,7 +517,7 @@ async function savePreset() {
         : { domains: preset.domains || [], tier: preset.tier || '' };
       await api.post('/admin/models', { id: slot, upstream, provider: pid, profile });
     }
-    toast(tf('models.preset.added', { n: pairs.length }));
+    toast(tf('models.preset.added', { n: pairs.length }) + syncedSuffix(synced));
     closeModal('modelModal');
     await boot();
   } catch (e) {
@@ -466,9 +550,6 @@ function customBody() {
     `<option value="${esc(x.name)}"${x.name === pid ? ' selected' : ''}>${esc(x.name)}${x.base_url ? ' · ' + esc(x.base_url) : ''}</option>`).join('');
   return `
     <div class="form-grid">
-      <label class="field"><span>${esc(t('models.custom.slot'))}</span>
-        <input id="cmId" value="${esc(slot)}"${editing ? ' readonly' : ''} placeholder="my-model-slot">
-        <small>${esc(t('models.custom.slotHint'))}</small></label>
       <label class="field"><span>${esc(t('models.custom.upstream'))}</span>
         <input id="cmUpstream" list="cmUpstreamOpts" value="${esc(upstream)}" placeholder="gpt-5.2">
         <datalist id="cmUpstreamOpts">${upstreamOpts.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
@@ -476,13 +557,10 @@ function customBody() {
           <button type="button" class="btn sm" id="fetchModels">${esc(t('models.custom.fetch'))}</button>
           <span class="mut" id="fetchMsg"></span>
         </small></label>
-    </div>
-    <div class="form-grid">
       <label class="field"><span>${esc(t('models.custom.provider'))}</span>
         <select id="cmProvider">${pidKnown ? provOpts : `<option value="" selected>${esc(t('common.none'))}</option>${provOpts}`}</select>
-        <small><button type="button" class="linkbtn" id="cmNewProvider">${esc(t('models.custom.newProvider'))}</button></small></label>
-      <div class="field"><span>&nbsp;</span>
-        <span class="mut" style="font-size:11px">${esc(t('models.custom.newProviderHint'))}</span></div>
+        <small><button type="button" class="linkbtn" id="cmNewProvider">${esc(t('models.custom.newProvider'))}</button></small>
+        <small>${esc(t('models.custom.newProviderHint'))}</small></label>
     </div>
     <div class="inline-form" id="cmProvInline"${d.provOpen ? '' : ' hidden'}>
       <div class="col-h sm">${esc(t('models.custom.newProvider'))}</div>
@@ -490,11 +568,14 @@ function customBody() {
         <label class="field"><span>${esc(t('models.prov.name'))}</span><input id="dprovName" value="${esc((d.provDraft && d.provDraft.name) || '')}"></label>
         <label class="field"><span>${esc(t('models.prov.baseurl'))}</span><input id="dprovBase" value="${esc((d.provDraft && d.provDraft.base_url) || '')}" placeholder="https://api.example.com/v1"></label>
       </div>
-      <div class="form-grid">
-        <label class="field"><span>${esc(t('models.prov.keyenv'))}</span><input id="dprovKeyEnv" value="${esc((d.provDraft && d.provDraft.key_env) || '')}" placeholder="EXAMPLE_API_KEY"></label>
-        <label class="field"><span>${esc(t('models.prov.format'))}</span>
-          <select id="dprovFormat">${formatOptions((d.provDraft && d.provDraft.reasoning_format) || 'openai')}</select></label>
-      </div>
+      <details class="adv" id="cmProviderAdvanced"${d.provAdvOpen ? ' open' : ''}>
+        <summary>${esc(t('models.advancedConnection'))}</summary>
+        <div class="form-grid">
+          <label class="field"><span>${esc(t('models.prov.keyenv'))}</span><input id="dprovKeyEnv" value="${esc((d.provDraft && d.provDraft.key_env) || '')}" placeholder="EXAMPLE_API_KEY"></label>
+          <label class="field"><span>${esc(t('models.prov.format'))}</span>
+            <select id="dprovFormat">${formatOptions((d.provDraft && d.provDraft.reasoning_format) || 'openai')}</select></label>
+        </div>
+      </details>
       <label class="field"><span>${esc(t('models.prov.apiKey'))}</span>
         <input id="dprovKey" type="password" autocomplete="off" value="${esc((d.provDraft && d.provDraft.api_key) || '')}"
                placeholder="${esc(t('models.prov.keyEmptyHint'))}"></label>
@@ -502,9 +583,12 @@ function customBody() {
     <label class="field"><span>${esc(t('models.custom.capability'))}</span>
       <textarea id="cmCapability" rows="3" placeholder="${esc(t('models.custom.capabilityHint'))}">${esc(capability)}</textarea>
       <small>${esc(t('models.custom.capabilityHint'))}</small></label>
-    <div id="reasonEditor">${reasonEditorBody()}</div>
-    <details class="adv"${d.advOpen ? ' open' : ''}>
+    <details class="adv" id="cmAdvanced"${d.advOpen ? ' open' : ''}>
       <summary>${esc(t('models.custom.advanced'))}</summary>
+      <label class="field"><span>${esc(t('models.custom.slot'))}</span>
+        <input id="cmId" value="${esc(slot)}"${editing ? ' readonly' : ''} placeholder="my-model-slot">
+        <small>${esc(t('models.custom.slotHint'))}</small></label>
+      <div id="reasonEditor">${reasonEditorBody()}</div>
       <div class="form-grid">
         <label class="field"><span>${esc(t('models.custom.tier'))}</span><input id="cmTier" value="${esc(tier)}" placeholder="large / small"></label>
         <label class="field"><span>${esc(t('models.custom.domains'))}</span><input id="cmDomains" value="${esc(domains)}" placeholder="health, computer_science"></label>
@@ -676,26 +760,38 @@ function captureCustom() {
       api_key: g('#dprovKey') || '',
     };
   }
-  d.advOpen = $('details.adv') ? $('details.adv').open : false;
+  d.advOpen = $('#cmAdvanced')?.open ?? false;
+  d.provAdvOpen = $('#cmProviderAdvanced')?.open ?? false;
   const sre = $('#rmSre');
   if (sre) rmState().sre = sre.checked;
 }
 async function saveCustom() {
   const editing = modal.mode === 'edit';
-  const id = ($('#cmId') ? $('#cmId').value.trim() : '');
   const upstream = ($('#cmUpstream') ? $('#cmUpstream').value.trim() : '');
+  const enteredId = ($('#cmId') ? $('#cmId').value.trim() : '');
+  /* A blank slot id is derived from the upstream id; a manual id always wins. */
+  const id = editing ? modal.editId
+    : enteredId || uniqueSlot(sanitizeSlot(upstream), modelIds());
   let provider = ($('#cmProvider') ? $('#cmProvider').value.trim() : '');
   const tier = ($('#cmTier') ? $('#cmTier').value.trim() : '');
   const domains = ($('#cmDomains') ? $('#cmDomains').value : '')
     .split(/[,，]/).map(s => s.trim()).filter(Boolean);
-  if (!editing && !MODEL_ID_RE.test(id)) { modalMsg('model', t('models.custom.idInvalid'), true); return; }
-  if (!upstream || !provider) { modalMsg('model', t('models.custom.required'), true); return; }
+  if (!upstream) {
+    modalMsg('model', t('models.custom.required'), true);
+    return;
+  }
+  if (!editing && !MODEL_ID_RE.test(id)) {
+    modalMsg('model', t('models.custom.idInvalid'), true);
+    return;
+  }
   const btn = $('#modelModalSave');
   btn.disabled = true;
   try {
     // inline "new provider" form wins when open and named
     const inline = $('#cmProvInline');
     let providerReady = providerNames().has(provider);
+    /* provider upsert / 模型编辑都可能同步画布：数量并入最终的一条 toast。 */
+    let synced = 0;
     if (inline && !inline.hidden) {
       const pname = $('#dprovName').value.trim();
       const pbase = $('#dprovBase').value.trim();
@@ -707,7 +803,9 @@ async function saveCustom() {
       };
       const key = ($('#dprovKey').value || '').trim();
       if (key) body.api_key = key;
-      await api.put(`/admin/providers/${encodeURIComponent(pname)}`, body);
+      const providerOutcome = await putProvider(pname, body);
+      if (!(await settleImpact(providerOutcome))) return;
+      synced += syncedCount(providerOutcome.result);
       provider = pname;
       providerReady = true;
     }
@@ -726,12 +824,26 @@ async function saveCustom() {
     if (reason.kind === 'false') profile.reasoning = false;
     else if (reason.kind === 'object') profile.reasoning = reason.value;
     if (editing) {
-      await api.put(`/admin/models/${encodeURIComponent(modal.editId)}`,
-        { upstream, provider, profile });
+      /* 模型编辑：被画布引用时第一次 PUT 只回 409 影响预览；确认后才带精确
+         哈希重试，取消则保留当前编辑框（草稿不丢）。 */
+      const outcome = await withImpactConfirmation(context => {
+        const path = `/admin/models/${encodeURIComponent(modal.editId)}`;
+        const payload = { upstream, provider, profile };
+        if (context) payload.impact_confirmation = context.impact_confirmation;
+        return api.put(path, payload);
+      });
+      if (!outcome.ok) {
+        if (outcome.conflict) {
+          modalMsg('model', t('impact.conflictToast'), true);
+          await boot();
+        }
+        return;
+      }
+      synced += syncedCount(outcome.result);
     } else {
       await api.post('/admin/models', { id, upstream, provider, profile });
     }
-    toast(t('common.saved'));
+    toast(t('common.saved') + syncedSuffix(synced));
     closeModal('modelModal');
     await boot();
   } catch (e) {
@@ -758,7 +870,7 @@ function openModelModal(kind, modelId) {
       id: model.id, upstream: model.upstream || '', provider: model.provider || '',
       tier: p.tier || '', domains: Array.isArray(p.domains) ? p.domains.join(', ') : '',
       capability: p.capability || '',
-      provOpen: false, advOpen: false,
+      provOpen: false, provAdvOpen: false, advOpen: false,
     };
   } else {
     rmState();
@@ -767,7 +879,7 @@ function openModelModal(kind, modelId) {
   $('#modelModalTitle').textContent = kind === 'edit' ? t('models.editTitle') : t('models.addTitle');
   $('#modelTabs').hidden = kind === 'edit';
   $$('#modelTabs .mtab').forEach(b => b.classList.toggle('on', b.dataset.tab === modal.tab));
-  $('#modelModalSave').textContent = t('models.save');
+  $('#modelModalSave').textContent = kind === 'edit' ? t('models.save') : t('models.connect');
   modalMsg('model', '');
   renderModelModal();
   openModal('modelModal');
@@ -779,11 +891,14 @@ function renderModelModal() {
   $$('#modelTabs .mtab').forEach(b => b.classList.toggle('on', b.dataset.tab === modal.tab));
   $('#modelModalTitle').textContent = modal.mode === 'edit' ? t('models.editTitle') : t('models.addTitle');
   const save = $('#modelModalSave');
-  if (save) save.textContent = t('models.save');
+  if (save) save.textContent = modal.mode === 'edit' ? t('models.save') : t('models.connect');
   $('#modelModalBody').innerHTML = modal.tab === 'custom' ? customBody() : presetBody();
 }
 
 /* ── provider modal ─────────────────────────────────────────────────── */
+/* `name == null` (add mode) is retained but no longer UI-reachable: providers
+   are created by the preset save or the inline custom-provider form, and
+   #provModal only opens from an existing provider card for editing. */
 function openProvModal(name) {
   const existing = name ? providerOf(name) : null;
   provModal = { name: name || null, mode: name ? 'edit' : 'add',
@@ -872,8 +987,15 @@ async function saveProviderModal() {
   const btn = $('#provModalSave');
   btn.disabled = true;
   try {
-    await api.put(`/admin/providers/${encodeURIComponent(name)}`, body);
-    toast(t('common.saved'));
+    const outcome = await putProvider(name, body);
+    if (!outcome.ok) {
+      if (outcome.conflict) {
+        modalMsg('prov', t('impact.conflictToast'), true);
+        await boot();
+      }
+      return;
+    }
+    toast(t('common.saved') + syncedSuffix(syncedCount(outcome.result)));
     closeModal('provModal');
     await boot();
   } catch (e) {
@@ -884,17 +1006,26 @@ async function saveProviderModal() {
 }
 async function deleteProvInModal() {
   if (!provModal || !provModal.name) return;
-  const btn = $('#pvDelete');
-  if (!(await armDelete(btn))) return;
+  if (!beginImpactPreview()) return;
+  const name = provModal.name;
   try {
-    await api.req('DELETE', `/admin/providers/${encodeURIComponent(provModal.name)}`);
+    /* 与目录卡片删除同一共享流程：引用存在时只展示不可绕过的清单，不写。 */
+    const outcome = await withImpactConfirmation(() =>
+      api.req('DELETE', `/admin/providers/${encodeURIComponent(name)}`));
+    if (!outcome.ok) {
+      if (outcome.conflict) {
+        modalMsg('prov', t('impact.conflictToast'), true);
+        await boot();
+      }
+      return;
+    }
     toast(t('models.deleted'));
     closeModal('provModal');
     await boot();
   } catch (e) {
-    modalMsg('prov', t('models.prov.ref') + ' · ' + errText(e), true);
-    btn.dataset.armed = '0';
-    btn.textContent = t('models.delete');
+    modalMsg('prov', tf('models.prov.deleteFail', { err: errText(e) }), true);
+  } finally {
+    endImpactPreview();
   }
 }
 
@@ -916,7 +1047,7 @@ async function fetchAvailableModels() {
     if (key) body.api_key = key;
   } else {
     const provider = $('#cmProvider') ? $('#cmProvider').value : '';
-    if (!provider) { msg.textContent = t('models.custom.required'); msg.classList.add('bad'); return; }
+    if (!provider) { msg.textContent = t('models.custom.fetchNeedProvider'); msg.classList.add('bad'); return; }
     body = { provider };
   }
   btn.disabled = true;
@@ -946,12 +1077,14 @@ async function fetchAvailableModels() {
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function boot() {
   let m = { models: [] }, prov = { providers: [] };
-  let jevBody = { config: null }, catalog = null;
+  /* 多服务目录：GET /admin/jev 返回 {services:[...]}；旧单配置 {config} 已删除，
+     读 config 只会拿到恒空值（旧代码的 stale JEV pill 即由此而来）。 */
+  let jevBody = { services: [] }, catalog = null;
   try {
     [m, prov, jevBody, catalog] = await Promise.all([
       api.get('/admin/models'),
       api.get('/admin/providers'),
-      api.get('/admin/jev').catch(() => ({ config: null })),
+      api.get('/admin/jev').catch(() => ({ services: [] })),
       api.get('/admin/model-catalog').catch(() => null),
     ]);
   } catch (e) {
@@ -959,7 +1092,7 @@ async function boot() {
   }
   STATE.models = m.models || [];
   STATE.providers = prov.providers || [];
-  STATE.jev = jevBody.config || {};
+  STATE.jev = Array.isArray(jevBody.services) ? jevBody.services : [];
   STATE.catalog = catalog && Array.isArray(catalog.providers) ? catalog : null;
   STATE.formats = catalog && Array.isArray(catalog.formats) ? catalog.formats : [];
   renderEngine(STATE.jev);
@@ -1056,7 +1189,6 @@ $('#modelModalSave').addEventListener('click', () => {
   else saveCustom();
 });
 
-$('#addProvider').addEventListener('click', () => openProvModal(null));
 $('#provModalBody').addEventListener('change', e => {
   const el = e.target;
   if (!provModal) return;
@@ -1093,13 +1225,13 @@ $('#modelTable').addEventListener('click', e => {
   const edit = e.target.closest('[data-editmodel]');
   if (edit) { openModelModal('edit', edit.dataset.editmodel); return; }
   const del = e.target.closest('[data-delmodel]');
-  if (del) { if (armDelete(del)) deleteModel(del.dataset.delmodel); return; }
+  if (del) { deleteModel(del.dataset.delmodel); return; }
 });
 $('#providers').addEventListener('click', e => {
   const edit = e.target.closest('[data-editprov]');
   if (edit) { openProvModal(edit.dataset.editprov); return; }
   const del = e.target.closest('[data-delprov]');
-  if (del) { if (armDelete(del)) deleteProvider(del.dataset.delprov); return; }
+  if (del) { deleteProvider(del.dataset.delprov); return; }
 });
 
 /* modal chrome: backdrop, ✕ / 取消, Esc */

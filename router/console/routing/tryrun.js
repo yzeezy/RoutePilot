@@ -35,6 +35,17 @@ const nodeName = id => {
   const node = graph ? RTGraph.findNode(graph, id) : null;
   return node ? nodeNameOf(node, graph) : (id || '—');
 };
+/* 试算范围：只有 select 显式选 route_set 才走已发布路由集，其余（含控件缺失）
+   一律按当前草稿处理，保持既有行为。 */
+function currentScope() {
+  const select = byId('cvTryScope');
+  return select && select.value === 'route_set' ? 'route_set' : 'draft';
+}
+/* 路由集结果只描述已发布图，节点标题不能被当前草稿画布「翻译」：同一 id 在
+   两张图里含义不同，直接显示原始 id 才是结果真正指向的节点。 */
+function resultNodeName(replay, id) {
+  return replay && replay.scope === 'route_set' ? String(id) : nodeName(id);
+}
 const clone = value => (value == null ? value : JSON.parse(JSON.stringify(value)));
 
 /* 五个样例 = 文本 + 固定 now。文本与 tests/fixtures/graph_scenarios.json 完全一致，
@@ -63,6 +74,13 @@ const GRAPH_EVENTS = new Set([
 const KIND_KEYS = {
   target: 'cv.tryKind.target', otherwise: 'cv.tryKind.fallback',
   error_fallback: 'cv.tryKind.fallback', sticky: 'cv.tryKind.sticky'
+};
+
+/* runtime_mismatch 的资源类型 → i18n 文案键（字面量键便于 i18n 死键检查）。 */
+const MISMATCH_KIND_KEYS = {
+  provider: 'cv.tryMismatchKind.provider',
+  model: 'cv.tryMismatchKind.model',
+  jev: 'cv.tryMismatchKind.jev'
 };
 
 let state = null;        /* 最近一次回放（与 App.replay 同一对象） */
@@ -110,7 +128,8 @@ function slotLine(slot) {
   if (slot.condition !== undefined && slot.condition !== null) pieces.push(label);
   else if (typeof slot.raw === 'boolean') pieces.push(label);
   pieces.push('→', statusText(slot.status));
-  return pieces.join(' ');
+  /* 开始节点的默认边没有条件文案（label 为空）：不要留下空片段和双空格。 */
+  return pieces.filter(piece => piece !== '').join(' ');
 }
 
 /* ── Step 3 · trace-only rebuild ──────────────────────────────── */
@@ -646,7 +665,9 @@ function apply(replay) {
     renderResult(null);
     return;
   }
-  const graph = graphNow();
+  /* 路由集结果没有当前画布坐标：只渲染结论/事实，绝不 paint、也不清掉当前草稿
+     的静态图。草稿与日志快照继续回放到当前画布（逐字保留既有行为）。 */
+  const graph = replay.scope === 'route_set' ? null : graphNow();
   if (graph) {
     /* 先清旧回放样式：无图事件时只保留静态图，绝不能继承上一次回放的涂色。 */
     removeReplayClasses();
@@ -698,20 +719,72 @@ function candidateNote(replay) {
   if (final.candidates.length > 1) {
     const winner = final.candidates.find(candidate => candidate.target_id === final.target_id) || final.candidates[0];
     const rival = final.candidates.find(candidate => candidate.target_id !== final.target_id) || final.candidates[1];
-    if (!rival) return tf('cv.tryUniqueTarget', { target: nodeName(final.target_id), priority: final.priority });
+    if (!rival) {
+      return tf('cv.tryUniqueTarget', {
+        target: resultNodeName(replay, final.target_id), priority: final.priority
+      });
+    }
     if (winner.priority === rival.priority) {
-      return tf('cv.tryPriorityTie', { priority: winner.priority, winner: nodeName(winner.target_id) });
+      return tf('cv.tryPriorityTie', {
+        priority: winner.priority, winner: resultNodeName(replay, winner.target_id)
+      });
     }
     return tf('cv.tryPriorityWin', {
       winner: winner.target_id, priority: winner.priority,
       rival: rival.target_id, rivalPriority: rival.priority
     });
   }
-  return tf('cv.tryUniqueTarget', { target: nodeName(final.target_id), priority: final.priority });
+  return tf('cv.tryUniqueTarget', {
+    target: resultNodeName(replay, final.target_id), priority: final.priority
+  });
 }
 
 function factHTML(labelKey, value) {
   return '<span class="rtc-try-fact"><i>' + esc(t(labelKey)) + '</i><b>' + esc(value) + '</b></span>';
+}
+
+/* 画布快照与数据库目录的差异只是 hint：展示资源/字段与两侧值，
+   绝不把它升级为运行失败或重跑语义。值可能很长（instructions/state_template/
+   大 profile），单行只展示截断预览；完整值不进 DOM，避免撑爆提示行。 */
+const MISMATCH_VALUE_MAX = 120;
+
+function mismatchValue(value) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); } catch (error) { return String(value); }
+  }
+  return rawText(value);
+}
+
+function mismatchPreview(value) {
+  const text = mismatchValue(value);
+  return text.length <= MISMATCH_VALUE_MAX
+    ? text
+    : text.slice(0, MISMATCH_VALUE_MAX - 1) + '…';
+}
+
+function mismatchHTML(replay) {
+  const warnings = Array.isArray(replay.warnings) ? replay.warnings : [];
+  const drifts = warnings.filter(item => item && item.code === 'runtime_mismatch');
+  if (!drifts.length) return '';
+  const lines = drifts.map(item => {
+    const params = item.params || {};
+    const kindKey = MISMATCH_KIND_KEYS[params.resource_kind];
+    const kind = kindKey ? t(kindKey) : String(params.resource_kind || '');
+    const line = tf('cv.tryMismatchLine', {
+      kind: kind, id: params.resource_id || '', field: params.field || ''
+    });
+    const values = tf('cv.tryMismatchValues', {
+      canvas: mismatchPreview(params.canvas),
+      database: mismatchPreview(params.database)
+    });
+    return '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
+      esc(line) + ' · ' + esc(values) + '</span></div>';
+  });
+  return '<div class="rtc-try-mismatch" data-runtime-mismatch="' + drifts.length + '">' +
+    '<div class="rtc-try-cmp"><span class="rtc-try-cmp-l">' +
+      esc(t('cv.tryMismatchTitle')) + '</span></div>' +
+    lines.join('') + '</div>';
 }
 
 function candidateChips(replay) {
@@ -719,7 +792,8 @@ function candidateChips(replay) {
   if (!final.candidates.length) {
     return '<span class="rtc-try-none">' + esc(t('cv.tryNoCandidates')) + '</span>' +
       '<span class="rtc-try-op">→</span>' +
-      '<span class="rtc-try-pick">' + esc(t('cv.tryFallback')) + ' ' + esc(nodeName(final.target_id)) + '</span>';
+      '<span class="rtc-try-pick">' + esc(t('cv.tryFallback')) + ' ' +
+        esc(resultNodeName(replay, final.target_id)) + '</span>';
   }
   return final.candidates.map((candidate, index) => {
     const win = candidate.target_id === final.target_id;
@@ -727,7 +801,7 @@ function candidateChips(replay) {
       '<span class="rtc-try-cand' + (win ? ' is-win' : '') + '"' +
       ' data-candidate="' + esc(candidate.target_id) + '" data-priority="' + esc(candidate.priority) + '"' +
       ' title="' + esc(candidate.target_id) + '">' +
-      esc(nodeName(candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i>' +
+      esc(resultNodeName(replay, candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i>' +
       (win ? '<em>' + esc(t('cv.tryWin')) + '</em>' : '') +
       '</span>';
   }).join('');
@@ -743,6 +817,8 @@ function renderResult(replay) {
     delete host.dataset.kind;
     delete host.dataset.selection;
     delete host.dataset.error;
+    delete host.dataset.tree;
+    delete host.dataset.graphSelection;
     return;
   }
   /* error 与 final 独立维护：后续调度/上游失败既不清除 final，也不被 final 掩盖。 */
@@ -755,6 +831,10 @@ function renderResult(replay) {
     delete host.dataset.final;
     host.dataset.kind = 'routing_error';
     host.dataset.selection = 'routing_error';
+    /* 失败回放也可能带选图证据（route_set 选图后执行失败）：照样暴露，避免
+       dataset.tree 停在上一次成功回放的旧值。 */
+    host.dataset.tree = replay.treeId || '';
+    host.dataset.graphSelection = replay.graphSelection || '';
     host.innerHTML =
       '<div class="rtc-try-res-h">' +
         '<span class="rtc-try-kind is-fb">' + esc(t('cv.tryRoutingFailed')) + '</span>' +
@@ -776,7 +856,8 @@ function renderResult(replay) {
       (error.message
         ? '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
             esc(error.message) + '</span></div>'
-        : '');
+        : '') +
+      mismatchHTML(replay);
     return;
   }
   const final = replay.final;
@@ -784,6 +865,10 @@ function renderResult(replay) {
   host.dataset.final = final.target_id;
   host.dataset.kind = final.kind;
   host.dataset.selection = final.sticky_hit ? 'sticky' : (final.selection_reason || final.kind);
+  /* 实际选图证据与最终目标分离：tree_id / graph_selection 描述「选了哪张图」，
+     dataset.selection 描述「目标为什么胜出」，两者不能互相覆盖。 */
+  host.dataset.tree = replay.treeId || '';
+  host.dataset.graphSelection = replay.graphSelection || '';
   const kindClass = final.kind === 'target' && !final.sticky_hit ? 'ok'
     : final.kind === 'otherwise' ? 'cand' : 'fb';
   const priorityText = final.priority === null || final.priority === undefined
@@ -803,18 +888,24 @@ function renderResult(replay) {
     ? '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
       esc(replay.error.message) + '</span></div>'
     : '';
+  /* 路由集回放不属于当前草图：不提供「按波次整理」，否则会按另一张图的波次
+     改写当前草稿的节点位置。日志快照（只读）依旧不提供任何写入口。 */
+  const wavesAction = !isReadOnly() && replay.scope !== 'route_set'
+    ? '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
+      esc(t('cv.tryWavesLayout')) + '</button>'
+    : '';
   host.innerHTML =
     '<div class="rtc-try-res-h">' +
       '<span class="rtc-try-kind is-' + kindClass + '">' + esc(finalKindLabel(replay)) + '</span>' +
       errorBadge +
       '<span class="rtc-try-lbl">' + esc(t('cv.tryFinal')) + '</span>' +
-      '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' + esc(nodeName(final.target_id)) + '</b>' +
+      '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' +
+        esc(resultNodeName(replay, final.target_id)) + '</b>' +
       '<span class="rtc-try-id">' + esc(final.target_id) + '</span>' +
       (final.model ? '<span class="rtc-try-model">' + esc(final.model) + '</span>' : '') +
       '<span class="rtc-try-acts">' +
         (isReadOnly() ? '' :
-          '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
-            esc(t('cv.tryWavesLayout')) + '</button>' +
+          wavesAction +
           '<button type="button" class="btn sm" id="cvTryRerun" data-try-act="rerun">' +
             esc(t('cv.tryRerun')) + '</button>' +
           '<button type="button" class="btn sm" id="cvTryClear" data-try-act="clear">' +
@@ -822,6 +913,8 @@ function renderResult(replay) {
       '</span>' +
     '</div>' +
     '<div class="rtc-try-facts">' +
+      factHTML('cv.tryFactTree', replay.treeId || '—') +
+      factHTML('cv.tryFactSelection', replay.graphSelection == null ? '—' : replay.graphSelection) +
       factHTML('cv.tryFactPriority', priorityText) +
       factHTML('cv.tryFactWaves', waveText) +
       factHTML('cv.tryFactCost', ms(totalDuration(replay))) +
@@ -833,7 +926,8 @@ function renderResult(replay) {
       '<span class="rtc-try-note' + (final.kind === 'error_fallback' ? ' is-warn' : '') + '">' +
         esc(candidateNote(replay)) + '</span>' +
     '</div>' +
-    errorMessage;
+    errorMessage +
+    mismatchHTML(replay);
 }
 
 /* ── run 生命周期 ─────────────────────────────────────────────── */
@@ -918,6 +1012,20 @@ function clear() {
 }
 
 function payloadFor(text, now) {
+  /* 试算范围必须先判断（Task 9）：route_set 是「真实已发布路由集」请求，只带
+     text/session_id/可选 department/now，绝不携带草稿的 root/tree_id/canvas/
+     timezone/sticky 与四运行字段 —— 这些字段一旦出现，服务端就会切到草稿路径，
+     按部门选图就不会发生。 */
+  const scopeSelect = byId('cvTryScope');
+  const scope = scopeSelect ? String(scopeSelect.value || 'draft') : 'draft';
+  if (scope === 'route_set') {
+    const payload = { text: text, session_id: '' };
+    const departmentInput = byId('cvTryDepartment');
+    const department = departmentInput ? String(departmentInput.value || '').trim() : '';
+    if (department) payload.department = department;
+    if (now) payload.now = now;
+    return payload;
+  }
   const graph = graphNow();
   const tree = treeNow();
   /* 画布坐标是内部工作状态：试算 payload 顶层只带 canvas，节点对象不带 position。 */
@@ -930,11 +1038,12 @@ function payloadFor(text, now) {
     text: text,
     session_id: ''
   };
-  /* 草稿的运行配置属于试算输入：有 runtime 时整组平铺进 payload，服务端不再按
-     活动树/数据库继承，试算结果必须与当前草稿看到的目录一致。 */
-  const runtime = typeof RTGraph.runtimeDocumentView === 'function'
-    ? RTGraph.runtimeDocumentView(tree) : null;
+  /* 完整草稿请求无条件携带四运行字段：试算严格使用画布快照，服务端不按任何
+     图或数据库继承。画布不变量保证 runtime 完整；万一缺失则退回引用已存树
+     （tree_id），由后端继承该树的已存快照，而不是发一个 root-only 半草稿。 */
+  const runtime = RTGraph.runtimeDocumentView(tree);
   if (runtime) Object.assign(payload, runtime);
+  else if (tree && tree.id) payload.tree_id = tree.id;
   if (now) payload.now = now;
   return payload;
 }
@@ -966,13 +1075,25 @@ async function run(text, options) {
     setBusy(true);
     const input = byId('cvTryInput');
     if (input && input.value !== inputText) input.value = inputText;
+    /* 范围在发请求前定格：运行期间用户改 select 也不能把回放归到另一个范围，
+       回放与请求体（payloadFor 同 tick 读取）必须描述同一次试算。 */
+    const requestScope = currentScope();
     const response = await api.post('/admin/try', payloadFor(inputText, now));
     if (token !== runSeq) return false;
-    const rebuilt = rebuild(response.trace || [], graphNow());
+    /* 路由集回放不属于当前画布：用空图重建，target/candidate/wave 全部来自 trace
+       与 response.outcome；草稿范围才拿当前图作为回放底图。 */
+    const replayGraph = requestScope === 'route_set' ? { nodes: [], edges: [] } : graphNow();
+    const rebuilt = rebuild(response.trace || [], replayGraph);
+    rebuilt.scope = requestScope;
     rebuilt.outcome = response.outcome || null;
     rebuilt.answers = response.answers || null;
     rebuilt.warnings = Array.isArray(response.warnings) ? response.warnings : [];
     rebuilt.draft = response.draft === true;
+    /* 实际选图证据（Task 9）：route_set 路径返回 tree_id + graph_selection；
+       草稿路径的 graph_selection 是 null，tree_id 是服务端的草稿快照 id（draft）。 */
+    rebuilt.treeId = typeof response.tree_id === 'string' ? response.tree_id : '';
+    rebuilt.graphSelection = typeof response.graph_selection === 'string'
+      ? response.graph_selection : null;
     rebuilt.trace = Array.isArray(response.trace) ? response.trace : [];
     rebuilt.text = inputText;
     rebuilt.now = now;
@@ -1009,6 +1130,12 @@ function rerun() {
 /* ── Step 4 · 按波次整理（只写 position，一次 App.change） ──────── */
 function layoutByWaves() {
   const replay = state;
+  /* 防御：路由集结果描述的是已发布图，绝不能拿它的波次去重排当前草稿画布
+     （按钮已隐藏，这里再拦一次直接调用）。 */
+  if (replay && replay.scope === 'route_set') {
+    toastNow(t('cv.tryRouteSetLayoutBlocked'), 'warn');
+    return false;
+  }
   const graph = graphNow();
   if (!graph) return false;
   if (!replay || !replay.final) {
@@ -1094,6 +1221,33 @@ function layoutByWaves() {
 }
 
 /* ── 试算台绑定 ───────────────────────────────────────────────── */
+/* 试算范围（Task 9）：draft = 当前草稿（默认，既有行为）；route_set = 已发布
+   实际路由集，按部门选图。控件由模块注入到输入行与样例 chips 之间，不新增
+   静态 HTML；可见性与禁用状态由 app.js 的 applyTryScope() 统一维护。 */
+function ensureScopeControls() {
+  const bar = byId('cvTryBar');
+  if (!bar || byId('cvTryScope')) return;
+  const host = document.createElement('div');
+  host.className = 'rtc-try-scope';
+  host.id = 'cvTryScopeRow';
+  host.innerHTML =
+    '<label class="rtc-try-scope-field">' +
+      '<span data-i18n="cv.tryScope">' + esc(t('cv.tryScope')) + '</span>' +
+      '<select id="cvTryScope" data-i18n-aria="cv.tryScope" aria-label="' + esc(t('cv.tryScope')) + '">' +
+        '<option value="draft" data-i18n="cv.tryScopeDraft">' + esc(t('cv.tryScopeDraft')) + '</option>' +
+        '<option value="route_set" data-i18n="cv.tryScopeRouteSet">' + esc(t('cv.tryScopeRouteSet')) + '</option>' +
+      '</select></label>' +
+    '<label class="rtc-try-scope-field" id="cvTryDepartmentLabel" hidden>' +
+      '<span data-i18n="cv.tryDepartment">' + esc(t('cv.tryDepartment')) + '</span>' +
+      '<input id="cvTryDepartment" type="text" autocomplete="off" spellcheck="false"' +
+      ' data-i18n-placeholder="cv.tryDepartmentPlaceholder" aria-label="' + esc(t('cv.tryDepartment')) +
+      '" placeholder="' + esc(t('cv.tryDepartmentPlaceholder')) + '"></label>' +
+    '<span class="rtc-try-scope-hint" data-i18n="cv.tryScopeHint">' + esc(t('cv.tryScopeHint')) + '</span>';
+  const row = bar.querySelector('.rtc-try-row');
+  if (row && row.nextSibling) bar.insertBefore(host, row.nextSibling);
+  else bar.appendChild(host);
+}
+
 function renderChips() {
   const host = byId('cvTryChips');
   if (!host) return;
@@ -1119,6 +1273,7 @@ function onAction(event) {
 function init() {
   if (bound) return;
   bound = true;
+  ensureScopeControls();
   renderChips();
   const input = byId('cvTryInput');
   if (input) {
@@ -1162,6 +1317,7 @@ function init() {
 }
 
 function refresh() {
+  ensureScopeControls();
   renderChips();
   renderWaveHeader();
   if (state) apply(state);

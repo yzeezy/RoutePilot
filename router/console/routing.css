@@ -46,6 +46,8 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 
 /* ── 页头 ─────────────────────────────────────────────────────── */
+/* z-index 必须高于画布浮层（节点库/检查器 22、缩放/小地图 23）：
+   顶栏动作在浮层上边缘被遮挡时会点不到，页头因此单独成层。 */
 .rtc-pagehead {
   flex: none;
   display: flex; align-items: flex-end; gap: 12px;
@@ -53,7 +55,7 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
   padding: 8px 16px 7px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
-  position: relative; z-index: 20;
+  position: relative; z-index: 24;
 }
 .rtc-headl { flex: 1 1 320px; min-width: 0; }
 .rtc-crumb { font-size: 10px; color: var(--text-3); letter-spacing: .02em; line-height: 1.4; }
@@ -72,32 +74,13 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 .rtc-treeselect:hover { background: var(--panel-2); border-color: var(--line); }
 .rtc-treeselect:focus { outline: none; border-color: var(--indigo-line); box-shadow: 0 0 0 3px var(--indigo-soft); }
-.rtc-rev { font-family: var(--mono); font-size: 10px; color: var(--text-2); padding: 3px 8px; }
-#cvDirty { font-weight: 600; }
-#cvDirty[data-kind="layout"] { background: var(--indigo-soft); border-color: var(--indigo-line); color: var(--indigo); }
-#cvClean .dot { background: var(--green); }
-#cvEnabled { padding: 3px 8px; }
+#cvLifecycle { font-weight: 600; padding: 3px 8px; }
+#cvLifecycle[data-state="disabled"] { color: var(--text-3); }
 
 .rtc-headr { flex: none; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .rtc-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 5px; }
 .rtc-actions .btn { font-size: 12px; }
 .rtc-actions .btn .rtc-ic { width: 13px; height: 13px; }
-.rtc-iconbtn { padding: 4px 7px; }
-.rtc-enable { gap: 6px; }
-.rtc-swt {
-  width: 22px; height: 12px; border-radius: 99px;
-  background: var(--line-2); position: relative; flex: none;
-  transition: background .15s;
-}
-.rtc-swt::after {
-  content: ''; position: absolute; left: 2px; top: 2px;
-  width: 8px; height: 8px; border-radius: 99px; background: var(--panel);
-  box-shadow: var(--shadow);
-  transition: transform .15s;
-}
-.rtc-enable.is-on { color: var(--green); border-color: var(--green-line); background: var(--green-soft); }
-.rtc-enable.is-on .rtc-swt { background: var(--green); }
-.rtc-enable.is-on .rtc-swt::after { transform: translateX(10px); }
 .rtc-issues-btn {
   cursor: pointer; color: var(--text-2); height: 27px;
   border: 1px solid var(--line); background: var(--panel);
@@ -106,6 +89,17 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-issues-btn .rtc-ic { width: 12px; height: 12px; }
 .rtc-issues-btn.warn { background: var(--amber-soft); border-color: var(--amber-line); color: var(--amber); }
 .rtc-issues-btn.bad { background: var(--red-soft); border-color: var(--red-line); color: var(--red); }
+
+/* 编辑类动作（撤销 / 重做 / 整理 / 保存草稿 / 新建 / 导入导出 / 停用）直接平铺，
+   不再收进「更多」菜单：菜单要多一次点击、展开后还会盖住画布。组内允许换行，
+   窄屏时整组按按钮逐个折行；与右侧主动作之间用一道竖线分隔。 */
+.rtc-tools {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+  padding-right: 8px; border-right: 1px solid var(--line);
+}
+@media (max-width: 720px) {
+  .rtc-tools { padding-right: 0; border-right: 0; }
+}
 
 /* ── 校验条 ───────────────────────────────────────────────────── */
 .rtc-issues {
@@ -396,14 +390,13 @@ body.is-try-running .rtc-stage.is-locked::after {
   font-family: var(--mono); font-size: 8px; color: var(--text-2);
   cursor: pointer;
 }
-.rtc-cond:not(.is-static):hover { border-color: var(--indigo-line); background: var(--indigo-soft); color: var(--indigo); }
+.rtc-cond:hover { border-color: var(--indigo-line); background: var(--indigo-soft); color: var(--indigo); }
 .rtc-cond.is-num {
   color: var(--teal);
   border-color: color-mix(in srgb, var(--teal) 28%, var(--panel));
   background: color-mix(in srgb, var(--teal) 7%, var(--panel));
 }
-.rtc-cond.is-num:not(.is-static):hover { border-color: var(--teal); }
-.rtc-cond.is-static { cursor: default; }
+.rtc-cond.is-num:hover { border-color: var(--teal); }
 .rtc-slot .rtc-live { margin-left: 2px; }
 
 /* 请求条件 */
@@ -440,7 +433,6 @@ body.is-try-running .rtc-stage.is-locked::after {
   border: 1px solid; border-radius: 4px; padding: 0 5px; line-height: 14px;
 }
 .rtc-fb--fallback { color: var(--amber); background: var(--amber-soft); border-color: var(--amber-line); }
-.rtc-tcap-inline { overflow: hidden; text-overflow: ellipsis; color: var(--text-2); }
 .rtc-tfoot {
   display: flex; align-items: center; gap: 6px; height: 21px;
   padding: 0 10px; border-top: 1px solid var(--line);
@@ -754,6 +746,32 @@ body.is-try-running .rtc-stage.is-locked::after {
   background: var(--panel-2); padding: 5px 8px; font-size: 11.5px;
 }
 .rtc-try-row input:focus { background: var(--panel); }
+/* 试算范围（Task 9）：范围选择常驻；部门输入只在 route_set 模式出现。
+   [hidden] 必须显式压过组件的 flex/inline-block 规则，否则隐藏不生效。 */
+.rtc-try-scope {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 5px; padding-left: 2px;
+}
+.rtc-try-scope [hidden] { display: none; }
+.rtc-try-scope-field {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 9px; color: var(--text-3); min-width: 0;
+}
+.rtc-try-scope-field select,
+.rtc-try-scope-field input {
+  border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2);
+  padding: 2px 5px; font: inherit; font-size: 10px; color: var(--text);
+}
+.rtc-try-scope-field input { width: 132px; }
+.rtc-try-scope-field select:focus,
+.rtc-try-scope-field input:focus {
+  background: var(--panel); border-color: var(--indigo);
+  box-shadow: 0 0 0 2px var(--indigo-soft);
+}
+.rtc-try-scope-field input:disabled { color: var(--text-3); cursor: not-allowed; }
+.rtc-try-scope-hint {
+  flex: 1 1 180px; min-width: 0; font-size: 8.5px; line-height: 1.5; color: var(--text-3);
+}
 .rtc-try-chips { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 5px; padding-left: 2px; }
 .rtc-trychip {
   border: 1px solid var(--line); background: var(--panel); border-radius: 99px;
@@ -1038,12 +1056,11 @@ body.is-log-snapshot .rtc-palette,
 body.is-log-snapshot .rtc-inspector,
 body.is-log-snapshot .rtc-actions,
 body.is-log-snapshot .rtc-issues-btn,
-body.is-log-snapshot .rtc-rev,
-body.is-log-snapshot #cvClean,
-body.is-log-snapshot #cvDirty { display: none; }
+body.is-log-snapshot #cvLifecycle { display: none; }
 /* 快照只读：默认不显示试算输入与样例；请求正文存在时把问题放回输入位（只读）。 */
 body.is-log-snapshot .rtc-try-row,
-body.is-log-snapshot .rtc-try-chips { display: none; }
+body.is-log-snapshot .rtc-try-chips,
+body.is-log-snapshot .rtc-try-scope { display: none; }
 body.is-log-snapshot.has-snapshot-request .rtc-try-row { display: flex; }
 body.is-log-snapshot .rtc-try-ico,
 body.is-log-snapshot #cvTryRun { display: none; }

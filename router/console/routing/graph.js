@@ -1,14 +1,14 @@
-/* RTGraph · 画布 v3 纯函数层（规格 §2.2–§2.8 / §5 / §6.1）
+/* RTGraph · 画布 v4 纯函数层（规格 §2.2–§2.8 / §5 / §6.1）
    ------------------------------------------------------------------
    ES module（浏览器 <script type="module"> / Node import 同一份源码）。
 
    约束：
    · 只做纯函数（不读 DOM、不读 window.MOCK、不发请求），可被 node 直测；
    · 所有函数显式接收 graph（root：{id,type,nodes,edges,error_fallback}）
-     或完整 envelope（{name,timezone,sticky,root}）；
+     或完整 envelope（{name,departments,enabled,default,timezone,sticky,root}）；
    · 算法移植自 docs/od-design/routing-canvas-2026-11-02/mock.js，但去掉了固定场景与组状态。
    ------------------------------------------------------------------ */
-const VERSION = 3;
+const VERSION = 4;
 const KIND = 'sr-routing-graph';
 const LIMITS = {
   nodes: 200,
@@ -28,9 +28,9 @@ const LOGIC = {
 };
 const NODE_TYPES = ['start', 'question', 'logic', 'condition', 'target'];
 const NODE_ORDER = { start: 0, condition: 1, question: 2, logic: 3, target: 4 };
-const REJECT_MESSAGE = '只接受 sr-routing-graph v3（本期不做旧格式兼容与转换）';
-const PARSE_ERROR_ZH = '图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）';
-const PARSE_ERROR_EN = 'Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)';
+const REJECT_MESSAGE = '只接受 sr-routing-graph v4（本期不做旧格式兼容与转换）';
+const PARSE_ERROR_ZH = '图解析失败：root 不符合 sr-routing-graph v4 结构（未知字段或类型非法）';
+const PARSE_ERROR_EN = 'Graph parse failed: root does not conform to the sr-routing-graph v4 structure (unknown fields or invalid types)';
 const HINTS = [
   '比较条件写在输入槽位上：数值线拖进任何布尔槽位后，点条件即可改成 > 0.75 这类阈值，不需要再放比较门。',
   '同一数值端口可以连到同一个判断门的两个槽位，分别写 > 0.3 与 < 0.8，就是区间条件。',
@@ -550,7 +550,8 @@ function hintIssues() {
 /* ── 运行配置（自包含画布 JSON 的四个顶层字段） ─────────────────────
    Python 事实源：router/routing/runtime.py、router/jev/config.py、
    router/jev/window.py、router/routing/conditions.py、router/reasoning.py。
-   四字段必须成组出现；全缺失 = 旧文档（运行时走数据库/全局配置回退）。 */
+   四字段必须成组出现：全缺失或部分缺失都拒绝解析/导入/保存，运行配置绝不再从
+   数据库补齐（服务端 router/routing/tree.py::tree_from_dict 同规则）。 */
 const RUNTIME_FIELDS = ['backends', 'jev', 'jev_window', 'time_periods'];
 /* 密钥与派生的密钥状态只存在于服务端：文档任意层级出现即拒绝。
    RUNTIME_SECRET_FIELDS 是对外展示的字段名；匹配用规范化集合（与 Python
@@ -576,7 +577,9 @@ function withoutSecretFields(value) {
 const BACKENDS_FIELDS = ['providers', 'models'];
 const PROVIDER_FIELDS = ['name', 'base_url', 'key_env', 'reasoning_format'];
 const MODEL_FIELDS = ['id', 'upstream', 'provider', 'profile'];
-const JEV_FIELDS = ['base_url', 'model', 'timeout_seconds', 'instructions', 'state_template'];
+/* 与 Python snapshot_dict() 同一份白名单：id 必填，密钥字段（api_key/key_present/key_source）
+   不在白名单里，出现在 jev 内即被 runtimeKeys 拒绝。 */
+const JEV_FIELDS = ['id', 'base_url', 'model', 'key_env', 'timeout_seconds', 'instructions', 'state_template'];
 const JEV_WINDOW_FIELDS = ['input_tokens', 'context_tokens'];
 const TIME_PERIOD_FIELDS = ['name', 'days', 'start', 'end'];
 const REASONING_PROFILE_FIELDS = ['format', 'efforts', 'default', 'supports_reasoning_effort'];
@@ -608,10 +611,15 @@ const RUNTIME_DEFAULTS = {
 
 /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
 /* canvas 是可选顶层字段：画布坐标只出现在文档顶层，节点对象不再携带 position。 */
-const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root', 'canvas'].concat(RUNTIME_FIELDS);
+const IMPORT_FIELDS = [
+  'kind', 'version', 'name', 'departments', 'enabled', 'default',
+  'timezone', 'sticky', 'root', 'canvas'
+].concat(RUNTIME_FIELDS);
 /* API envelope 是内部树形态：runtime 以嵌套对象携带；扁平四字段也接受（Python tree_to_dict）。 */
-const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision',
-  'updated_at', 'runtime'].concat(RUNTIME_FIELDS);
+const ENVELOPE_FIELDS = [
+  'id', 'name', 'enabled', 'default', 'departments', 'timezone', 'sticky',
+  'root', 'tree_revision', 'updated_at', 'runtime', 'document_sha256'
+].concat(RUNTIME_FIELDS);
 const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'error_fallback'];
 /* 导入文档的节点契约：只有逻辑字段。内部草稿节点仍保留 position 工作状态。 */
 const NODE_FIELDS = {
@@ -619,6 +627,7 @@ const NODE_FIELDS = {
   question: ['id', 'type', 'question_type', 'instructions', 'title', 'options', 'criteria'],
   logic: ['id', 'type', 'operator', 'title'],
   condition: ['id', 'type', 'source', 'contains_any', 'periods', 'title'],
+  /* strategy / capability 已下线；仍允许旧文档携带（读取时忽略，导出时丢弃）。 */
   target: ['id', 'type', 'models', 'priority', 'strategy', 'capability', 'title'],
 };
 const EDGE_FIELDS = ['id', 'source', 'source_port', 'target', 'target_port', 'condition'];
@@ -695,10 +704,6 @@ function validateContract(value, graph, issues) {
       issues.push(issue('graph_parse_error', '未知条件来源：' + String(node.source),
         'Unknown condition source: ' + String(node.source), { node_id: String(node.id || '') }));
     }
-    if (node.type === 'target' && node.strategy != null && node.strategy !== 'least_inflight') {
-      issues.push(issue('graph_parse_error', 'target.strategy 必须为 least_inflight',
-        'target.strategy must be least_inflight', { node_id: String(node.id || '') }));
-    }
     (Array.isArray(node.options) ? node.options : []).filter(isRecord).forEach(option => {
       addUnknownFields(option, ['key', 'label', 'capability'], 'question option', issues, String(node.id || ''));
     });
@@ -716,6 +721,24 @@ function validateContract(value, graph, issues) {
     addUnknownFields(value, ENVELOPE_FIELDS, 'tree', issues, '');
     if (typeof value.name !== 'string') {
       issues.push(issue('graph_parse_error', 'tree.name 必须是字符串', 'tree.name must be a string'));
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'enabled') && typeof value.enabled !== 'boolean') {
+      issues.push(issue('graph_parse_error', 'enabled 必须是 boolean', 'enabled must be a boolean'));
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'default') && typeof value.default !== 'boolean') {
+      issues.push(issue('graph_parse_error', 'default 必须是 boolean', 'default must be a boolean'));
+    }
+    if (value.default === true && value.enabled !== true) {
+      issues.push(issue('graph_parse_error', 'default graph must be enabled',
+        'default graph must be enabled'));
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'departments')) {
+      try {
+        normalizeDepartments(value.departments);
+      } catch (error) {
+        issues.push(issue('graph_parse_error', 'departments 非法：' + error.message,
+          'Invalid departments: ' + error.message));
+      }
     }
     if (!isNonEmptyString(value.timezone)) {
       issues.push(issue('graph_parse_error', 'timezone 必须是非空字符串', 'timezone must be a nonempty string'));
@@ -1468,6 +1491,18 @@ function normalizeRuntimeJev(raw, issues) {
     return null;
   }
   runtimeKeys(raw, JEV_FIELDS, 'jev', issues);
+  /* Python runtime._jev：id 必填（服务快照的身份），key_env 缺省为空串。 */
+  if (!hasOwnField(raw, 'id')) {
+    runtimeIssue(issues, 'jev.id 是必填字段', 'jev.id is required');
+    return null;
+  }
+  const id = runtimeId(raw.id, 'jev.id', issues);
+  const keyEnv = hasOwnField(raw, 'key_env') ? raw.key_env : RUNTIME_DEFAULTS.key_env;
+  const keyEnvOk = typeof keyEnv === 'string' && (!keyEnv || RUNTIME_ENV_RE.test(keyEnv));
+  if (!keyEnvOk) {
+    runtimeIssue(issues, 'jev.key_env 必须是空串或合法环境变量名',
+      'jev.key_env must be empty or a valid environment variable name');
+  }
   let baseUrl = null;
   if (typeof raw.base_url !== 'string') {
     runtimeIssue(issues, 'jev.base_url 必须是 http/https URL', 'jev.base_url must be an http/https URL');
@@ -1505,10 +1540,13 @@ function normalizeRuntimeJev(raw, issues) {
   } else {
     templateFieldIssues(stateTemplate, 'jev.state_template', issues);
   }
-  if (baseUrl === null) return null;
+  if (id === null || baseUrl === null) return null;
+  /* 键顺序与 Python snapshot_dict() 一致：id 在前、key_env 在 model 之后。 */
   return {
+    id: id,
     base_url: baseUrl,
     model: model,
+    key_env: keyEnv,
     timeout_seconds: timeout,
     instructions: instructions,
     state_template: stateTemplate
@@ -1650,7 +1688,8 @@ function pickRuntimeFields(value) {
 }
 
 /* 内部树（嵌套 runtime）或 API envelope（扁平四字段）里取 runtime；无 runtime 返回 null。
-   嵌套优先；显式 runtime:null 且没有扁平字段时视为旧文档（无 runtime）。 */
+   严格契约下内部树恒带嵌套 runtime；扁平模板只出现在保存/试算 envelope 里。
+   返回值是「四字段容器」，未做字段校验（validateRuntime 负责）。 */
 function runtimeOf(value) {
   if (!isRecord(value)) return null;
   if (isRecord(value.runtime)) return value.runtime;
@@ -1675,41 +1714,51 @@ function addRuntimeGroupIssues(raw, issues, flat) {
   local.forEach(item => issues.push(item));
 }
 
-/* validate / validateRuntime 共用：嵌套 runtime 与扁平四字段都接受。 */
+/* validate / validateRuntime 共用：只接受完整运行配置（嵌套 runtime 或扁平四字段）。
+   `runtime: null` 与「完全没有运行字段」都是旧文档形态，一律报硬错误：
+   前端不再维护「保存时再物化」的第二条路径。 */
 function addRuntimeEnvelopeIssues(value, issues) {
   const hasNested = hasOwnField(value, 'runtime');
-  const flatPresent = RUNTIME_FIELDS.filter(field => hasOwnField(value, field));
-  if (hasNested && isRecord(value.runtime)) {
+  if (hasNested) {
+    if (!isRecord(value.runtime)) {
+      runtimeIssue(issues, '运行配置必须是对象：不接受 runtime:null（旧文档请重新导入完整 v4 文档）',
+        'Runner config must be an object: runtime:null is not accepted (re-import a complete v4 document)');
+      return;
+    }
     addRuntimeGroupIssues(value.runtime, issues, false);
     return;
   }
-  if (flatPresent.length) {
-    addRuntimeGroupIssues(value, issues, true);
-    return;
-  }
-  if (hasNested && value.runtime !== null) {
-    runtimeIssue(issues, 'runtime 必须是对象或 null', 'runtime must be an object or null');
-  }
+  addRuntimeGroupIssues(value, issues, true);
 }
 
-/* 公开 API：合法返回 []；支持 runtime 对象、内部树（嵌套）与 API envelope（扁平）。 */
+/* 公开 API：合法返回 []；支持 runtime 对象、内部树（嵌套）与 API envelope（扁平）。
+   缺少运行配置或 runtime:null 都是 graph_parse_error（保存/启用前的硬错误）。 */
 function validateRuntime(value) {
   const issues = [];
-  if (value === null || value === undefined) return issues;
   if (!isRecord(value)) {
-    runtimeIssue(issues, '运行配置必须是对象或 null', 'Runner config must be an object or null');
-    return finishIssues(issues);
-  }
-  const hasNested = hasOwnField(value, 'runtime');
-  const flatPresent = RUNTIME_FIELDS.some(field => hasOwnField(value, field));
-  if (!hasNested && !flatPresent) {
-    /* 没有 runtime（旧草稿/旧文档/裸图）是合法的。 */
-    if (graphOf(value) || hasOwnField(value, 'root')) return issues;
-    runtimeIssue(issues, '运行配置必须是对象或 null', 'Runner config must be an object or null');
+    runtimeIssue(issues, '运行配置必须是对象', 'Runner config must be an object');
     return finishIssues(issues);
   }
   addRuntimeEnvelopeIssues(value, issues);
   return finishIssues(issues);
+}
+
+/* 导出/保存前的完整性守卫：缺字段或部分运行字段 → 抛带字段名的明确错误。
+   serialize() 与 controller 的保存 payload 共用（服务端同样会 422）。 */
+function requireCompleteRuntime(value, action) {
+  const runtime = runtimeOf(value);
+  const missing = RUNTIME_FIELDS.filter(field => !runtime || !hasOwnField(runtime, field));
+  if (missing.length) {
+    throw new Error('画布缺少运行配置字段（' + action + '）：' + missing.join(', ') +
+      '；四字段 backends/jev/jev_window/time_periods 必须成组出现');
+  }
+  const issues = [];
+  const normalized = normalizeRuntime(pickRuntimeFields(runtime), issues);
+  if (normalized === null) {
+    const first = issues.find(item => item.code === 'graph_parse_error') || issues[0];
+    throw new Error('画布运行配置非法（' + action + '）：' + (first ? first.zh : 'invalid runtime'));
+  }
+  return runtimeView(normalized);
 }
 
 /* Python _behavior_numbers 的 JS 等价：整数值数字输出整数；非整数用 pyFloat
@@ -1746,8 +1795,10 @@ function runtimeView(runtime) {
     }));
   const jevRaw = isRecord(runtime) && isRecord(runtime.jev) ? runtime.jev : null;
   const jev = jevRaw === null ? null : {
+    id: jevRaw.id,
     base_url: jevRaw.base_url,
     model: jevRaw.model,
+    key_env: hasOwnField(jevRaw, 'key_env') ? jevRaw.key_env : RUNTIME_DEFAULTS.key_env,
     timeout_seconds: hasOwnField(jevRaw, 'timeout_seconds')
       ? jevRaw.timeout_seconds : RUNTIME_DEFAULTS.timeout_seconds,
     instructions: hasOwnField(jevRaw, 'instructions')
@@ -1793,6 +1844,17 @@ function runtimeDocumentView(value) {
 
 /* ── 6. 行为 canonical / changeKind（§2.8） ─────────────────────────── */
 
+/* 已下线的 target 字段：旧文档仍可导入，但不在草稿/导出里继续携带。 */
+function stripRemovedTargetFields(root) {
+  if (!isRecord(root) || !Array.isArray(root.nodes)) return root;
+  root.nodes.forEach(node => {
+    if (!isRecord(node) || node.type !== 'target') return;
+    delete node.strategy;
+    delete node.capability;
+  });
+  return root;
+}
+
 function normalizedNode(node, includeDisplay) {
   const output = { id: String(node.id == null ? '' : node.id), type: node.type };
   if (node.type === 'question') {
@@ -1828,11 +1890,9 @@ function normalizedNode(node, includeDisplay) {
       reasoning: item && item.reasoning != null ? item.reasoning : null
     }));
     output.priority = node.priority;
-    output.strategy = node.strategy || 'least_inflight';
   }
   if (includeDisplay) {
     output.title = node.title == null ? '' : node.title;
-    if (node.type === 'target') output.capability = node.capability == null ? '' : node.capability;
     output.position = isRecord(node.position) &&
       isFiniteNumber(node.position.x) && isFiniteNumber(node.position.y)
       ? { x: node.position.x, y: node.position.y }
@@ -1887,11 +1947,56 @@ function rootView(graph, includeDisplay) {
   };
 }
 
+/* Python len()/sorted() 的 Unicode 语义：按码点（而不是 UTF-16 码元）计数与排序。
+   非 BMP 字符（如 emoji）在 UTF-16 里是代理对，`.length` 与默认 `sort()` 会与服务端
+   码点口径分歧，进而让 behavior canonical / behavior_sha256 跨运行时不一致。 */
+function compareCodePoints(left, right) {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = a[index].codePointAt(0) - b[index].codePointAt(0);
+    if (difference !== 0) return difference;
+  }
+  return a.length - b.length;
+}
+
+/* 部门规范化：唯一实现。导入、API envelope 与 createMinimalTree 共用；
+   失败一律抛 Error，由调用方（parseImport）转成 graph_parse_error。 */
+function normalizeDepartments(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('departments must be a list of strings');
+  const values = value.map(item => {
+    if (typeof item !== 'string') throw new Error('departments must be a list of strings');
+    const department = item.trim();
+    /* 与 Python 的 len(value) > 64 及控制字符检查一样按码点扫描。 */
+    const codePoints = Array.from(department);
+    if (!codePoints.length || codePoints.length > 64 ||
+        codePoints.some(char => char.codePointAt(0) < 0x20 || char.codePointAt(0) === 0x7f)) {
+      throw new Error('department is empty, too long, or contains control characters');
+    }
+    return department;
+  });
+  if (new Set(values).size !== values.length) throw new Error('duplicate department');
+  return values.sort(compareCodePoints);
+}
+
+/* 宽松版本：行为/可编辑 canonical 必须永远可计算（changeKind 对任意草稿调用），
+   非法部门在 validate 里作为硬 Issue 报告，不在这里抛异常。 */
+function departmentsOf(tree) {
+  try {
+    return normalizeDepartments(isRecord(tree) ? tree.departments : undefined);
+  } catch (error) {
+    return [];
+  }
+}
+
 function envelopeParts(tree) {
   const value = isRecord(tree) ? tree : {};
   const sticky = isRecord(value.sticky) ? value.sticky : {};
   return {
     name: value.name == null ? '' : value.name,
+    departments: departmentsOf(value),
     timezone: isNonEmptyString(value.timezone) ? value.timezone : 'Asia/Shanghai',
     sticky: {
       enabled: sticky.enabled === true,
@@ -1904,12 +2009,13 @@ function envelopeParts(tree) {
 function behaviorCanonical(tree) {
   const parts = envelopeParts(tree);
   const view = {
+    departments: parts.departments,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: rootView(parts.root, false)
   };
-  /* 自包含运行配置属于行为：旧文档（无 runtime）输出逐字节不变。
-     整数值数字归一为 int、非整数走 Python repr，保证与 tree_revision_of 一致。 */
+  /* 自包含运行配置属于行为：四字段参与 canonical（与服务端 tree_behavior_dict 同序）。
+     整数值数字归一为 int、非整数走 Python repr，保证与 tree_revision_of 逐字节一致。 */
   const runtime = runtimeBehaviorView(tree);
   if (runtime) Object.assign(view, runtimeBehaviorNumbers(runtime));
   return stableStringify(view);
@@ -1923,6 +2029,7 @@ function editableCanonical(tree, stripPosition) {
   }
   const canonical = {
     name: parts.name,
+    departments: parts.departments,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: view
@@ -2038,13 +2145,16 @@ function serialize(tree) {
     kind: KIND,
     version: VERSION,
     name: parts.name,
+    departments: parts.departments,
+    enabled: isRecord(tree) && tree.enabled === true,
+    default: isRecord(tree) && tree.default === true,
     timezone: parts.timezone,
     sticky: parts.sticky,
-    root: clone(parts.root)
+    root: stripRemovedTargetFields(clone(parts.root))
   };
-  /* 自包含文档：runtime 非空时平铺四字段（jev 可为 null）；旧文档不输出 runtime 键。 */
-  const runtime = runtimeDocumentView(tree);
-  if (runtime) Object.assign(document, runtime);
+  /* 自包含文档：四字段无条件平铺（jev 可为 null）；缺字段/部分字段时抛明确错误，
+     与 parseImport、服务端 tree_from_dict 一样不维护「旧文档」导出分支。 */
+  Object.assign(document, requireCompleteRuntime(tree, '导出'));
   /* 导出：节点位置收集进顶层 canvas，节点对象只留逻辑字段；没有坐标时不输出 canvas。 */
   return JSON.stringify(collectCanvas(document, { round: true }), null, 2);
 }
@@ -2087,6 +2197,31 @@ function parseImport(text) {
       )]
     };
   }
+  /* v4 envelope：enabled/default 必须是 boolean 且 default => enabled；
+     departments 必须能规范化（失败转成 graph_parse_error，绝不让异常中断导入）。 */
+  const lifecycleIssues = [];
+  if (typeof data.enabled !== 'boolean') {
+    lifecycleIssues.push(issue('graph_parse_error', 'enabled 必须是 boolean',
+      'enabled must be a boolean'));
+  }
+  if (typeof data.default !== 'boolean') {
+    lifecycleIssues.push(issue('graph_parse_error', 'default 必须是 boolean',
+      'default must be a boolean'));
+  }
+  if (data.default === true && data.enabled !== true) {
+    lifecycleIssues.push(issue('graph_parse_error', 'default graph must be enabled',
+      'default graph must be enabled'));
+  }
+  let departments = [];
+  try {
+    departments = normalizeDepartments(data.departments);
+  } catch (error) {
+    lifecycleIssues.push(issue('graph_parse_error', 'departments 非法：' + error.message,
+      'Invalid departments: ' + error.message));
+  }
+  if (lifecycleIssues.length) {
+    return { ok: false, error: PARSE_ERROR_ZH, issues: finishIssues(lifecycleIssues) };
+  }
   /* 密钥与派生的密钥状态只存在于服务端：文档任意层级出现即整体拒绝。 */
   const secretField = findSecretField(data);
   if (secretField) {
@@ -2103,7 +2238,7 @@ function parseImport(text) {
   }
   const raw = data.root;
   if (!isRecord(raw) || raw.type !== 'graph' || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
-    /* kind/version 正确的 v3 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
+    /* kind/version 正确的 v4 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
        固定拒绝文案只留给旧 jev / version 2 / 错误 kind。 */
     return {
       ok: false,
@@ -2111,7 +2246,7 @@ function parseImport(text) {
       issues: [issue('graph_parse_error', PARSE_ERROR_ZH, PARSE_ERROR_EN)]
     };
   }
-  const graph = clone(raw);
+  const graph = stripRemovedTargetFields(clone(raw));
   graph.id = isNonEmptyString(graph.id) ? graph.id : 'root';
   graph.type = 'graph';
   /* 非对象条目不做静默丢弃：保留在 tree 中交给 validate 报 graph_parse_error。 */
@@ -2133,11 +2268,10 @@ function parseImport(text) {
     };
   }
 
-  /* 四字段成组出现：部分接受会让运行配置半生效，一律整体拒绝。 */
-  const runtimePresent = RUNTIME_FIELDS.filter(field => hasOwnField(data, field));
-  let runtime = null;
-  if (runtimePresent.length && runtimePresent.length !== RUNTIME_FIELDS.length) {
-    const missingRuntime = RUNTIME_FIELDS.filter(field => !hasOwnField(data, field)).sort();
+  /* 四字段必须成组出现（严格自包含）：全缺失或部分缺失都整体拒绝，绝不再接受
+     「旧文档」并交给数据库补齐。 */
+  const missingRuntime = RUNTIME_FIELDS.filter(field => !hasOwnField(data, field)).sort();
+  if (missingRuntime.length) {
     const textZh = '运行配置字段必须成组出现，缺少：' + missingRuntime.join(', ');
     return {
       ok: false,
@@ -2149,14 +2283,12 @@ function parseImport(text) {
       )]
     };
   }
-  if (runtimePresent.length === RUNTIME_FIELDS.length) {
-    const runtimeIssues = [];
-    runtime = normalizeRuntime(pickRuntimeFields(data), runtimeIssues);
-    /* 运行时默认值（jev 缺省键、key_env、reasoning_format）在导入时补齐，
-       使 serialize(parseImport(x)) 稳定且行为 canonical 与 Python 一致。 */
-    if (runtime === null) {
-      return { ok: false, error: PARSE_ERROR_ZH, issues: finishIssues(runtimeIssues) };
-    }
+  const runtimeIssues = [];
+  const runtime = normalizeRuntime(pickRuntimeFields(data), runtimeIssues);
+  /* 运行时默认值（jev 缺省键、key_env、reasoning_format）在导入时补齐，
+     使 serialize(parseImport(x)) 稳定且行为 canonical 与 Python 一致。 */
+  if (runtime === null) {
+    return { ok: false, error: PARSE_ERROR_ZH, issues: finishIssues(runtimeIssues) };
   }
 
   /* canvas 形状/引用校验在分发前完成；坐标集中顶层 canvas，导入时分发回内部 node.position。 */
@@ -2178,11 +2310,14 @@ function parseImport(text) {
   const rawSticky = data.sticky === null ? {} : data.sticky;
   const tree = {
     name: data.name,
+    departments: departments,
+    enabled: false,
+    default: false,
     timezone: data.timezone,
     sticky: rawSticky,
     root: graph,
-    /* 旧文档也显式给 runtime:null：调用方可用统一方式读取（undefined 会让
-       JSON 序列化丢键，且 behaviorCanonical 需要区分「无 runtime」）。 */
+    /* 导入输出的内部树只带嵌套 runtime；保存/试算时再由 runtimeDocumentView 投影成
+       扁平四字段（服务端文档形态），内部不保留任何「无 runtime」中间态。 */
     runtime: runtime
   };
   const issues = finishIssues(canvasIssues.concat(validate(tree)));
@@ -2203,12 +2338,38 @@ function parseImport(text) {
 
 /* ── 9. 新建最小图 ─────────────────────────────────────────────────── */
 
-function createMinimalTree(model) {
-  const targetModel = isNonEmptyString(model) ? model : 'qwen3-8b';
+/* 新建最小图：必须收到完整 runtime（createRuntime()/createMinimalTree 调用方负责），
+   模型也必须在 runtime 快照里（Python 保存时 target 引用快照外模型是硬错误）。
+   缺 runtime、runtime 非法或模型不在快照里都抛明确错误，不做数据库/默认物化。 */
+function createMinimalTree(model, runtime) {
+  const targetModel = isNonEmptyString(model)
+    ? model
+    : (isRecord(runtime) && isRecord(runtime.backends) &&
+        Array.isArray(runtime.backends.models) && runtime.backends.models.length
+      ? runtime.backends.models[0].id
+      : '');
+  const issues = [];
+  const normalized = isRecord(runtime)
+    ? normalizeRuntime(runtime, issues)
+    : null;
+  if (normalized === null) {
+    const first = issues.find(item => item.code === 'graph_parse_error') || issues[0];
+    throw new Error('createMinimalTree 需要完整运行配置：' +
+      (first ? first.zh : 'runtime must be a complete backends/jev/jev_window/time_periods object'));
+  }
+  const known = normalized.backends.models.some(item => item && item.id === targetModel);
+  if (!known) {
+    throw new Error('运行配置中没有模型 ' + String(targetModel) +
+      '：画布 target 必须引用快照内模型（runtime is missing model ' + String(targetModel) + '）');
+  }
   return {
     name: '新决策组',
+    departments: [],
+    enabled: false,
+    default: false,
     timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
+    runtime: normalized,
     root: {
       id: 'root',
       type: 'graph',
@@ -2219,7 +2380,6 @@ function createMinimalTree(model) {
           type: 'target',
           models: [{ model: targetModel }],
           priority: 1,
-          strategy: 'least_inflight',
           position: { x: 420, y: 180 }
         }
       ],
@@ -2260,6 +2420,7 @@ export {
   REASONING_FORMATS,
   clone,
   stableStringify,
+  normalizeDepartments,
   graphOf,
   findNode,
   portsOf,

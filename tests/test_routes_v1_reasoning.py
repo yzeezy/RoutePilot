@@ -1,5 +1,4 @@
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -7,15 +6,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.routing.conditions import TimePeriod
-from router.routing.graph.compiled import compile_graph
-from router.routing.snapshot import build_snapshot, model_capability, read_jev_window
 from router.store.db import connect
-from router.store.jev_config import JevConfigRepo
-from router.store.repositories import ModelRepo, TimePeriodRepo
-from router.store.routing_trees import GraphStorageError
-from router.upstream.catalog import load_backends
-from tests.routing_fixtures import test_settings, tree_dict
+from router.upstream.runtime_keys import tree_scope
+from tests.routing_fixtures import runtime_from_catalog, test_settings, tree_dict
 
 TEXT = "今天天气怎么样"
 
@@ -63,9 +56,23 @@ def direct_graph(reasoning=None):
     }
 
 
-def activate(client, level=None):
+def activate(h, level=None):
+    """保存并启用一棵画布：运行配置从当前数据库目录显式物化。
+
+    严格自包含语义下目录写不再回写画布，所以这里模拟「按当前目录刷新画布」
+    的显式动作，而不是依赖已删除的全局同步。
+    """
     raw = tree_dict("default-tree", root=direct_graph(level))
-    body = {"id": raw["id"], "name": raw["name"], "root": raw["root"], "sticky": raw["sticky"], "timezone": raw["timezone"]}
+    conn = connect(h.app.state.settings.db_path)
+    try:
+        runtime = runtime_from_catalog(conn)
+    finally:
+        conn.close()
+    body = {
+        "id": raw["id"], "name": raw["name"], "root": raw["root"],
+        "sticky": raw["sticky"], "timezone": raw["timezone"], **runtime,
+    }
+    client = h.client
     existing = client.get("/admin/trees/default-tree")
     if existing.status_code == 200:
         body["base_document_sha256"] = existing.json()["tree"]["document_sha256"]
@@ -76,11 +83,36 @@ def activate(client, level=None):
     assert client.post("/admin/trees/default-tree/enable").status_code == 200
 
 
+def _confirmation_from(response):
+    """409 影响预览 → 携带当前画布哈希的确认载荷。"""
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required", response.text
+    return {"trees": [
+        {"id": item["id"], "document_sha256": item["document_sha256"]}
+        for item in detail["affected_trees"]
+    ]}
+
+
+def _put_with_confirmation(client, path, payload):
+    """目录写两阶段：未确认的 409 预览用当前哈希确认重试。"""
+    preview = client.put(path, json=payload)
+    if preview.status_code != 409:
+        return preview
+    return client.put(path, json={
+        **payload, "impact_confirmation": _confirmation_from(preview)})
+
+
 def declare(client, reasoning, *, provider_format=None):
     if provider_format:
-        response = client.put("/admin/providers/local", json={"base_url": "http://upstream.test/v1", "reasoning_format": provider_format})
+        response = _put_with_confirmation(client, "/admin/providers/local", {
+            "base_url": "http://upstream.test/v1",
+            "reasoning_format": provider_format,
+        })
         assert response.status_code == 200, response.text
-    response = client.put("/admin/models/qwen3-8b", json={"profile": {"reasoning": reasoning}})
+    response = _put_with_confirmation(
+        client, "/admin/models/qwen3-8b",
+        {"profile": {"reasoning": reasoning}})
     assert response.status_code == 200, response.text
 
 
@@ -90,7 +122,7 @@ def chat(client, **body):
 
 def test_null_reasoning_is_full_passthrough(tmp_path):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"efforts": {"off": None, "high": "high"}})
     fields = {"reasoning_effort": "client", "reasoning": {"effort": "client"}, "thinking": {"type": "enabled"}, "enable_thinking": True}
     response = chat(h.client, **fields)
@@ -117,9 +149,9 @@ FORMAT_CASES = [
 @pytest.mark.parametrize("fmt,efforts,level,expected", FORMAT_CASES)
 def test_reasoning_injection_per_format(tmp_path, fmt, efforts, level, expected):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"format": fmt, "efforts": efforts})
-    activate(h.client, level)
+    activate(h, level)
     response = chat(h.client, reasoning_effort="client", thinking="client", enable_thinking=False, chat_template_kwargs={"keep": 1})
     assert response.status_code == 200, response.text
     assert response.headers["x-sr-reasoning"] == level
@@ -133,57 +165,23 @@ def test_reasoning_injection_per_format(tmp_path, fmt, efforts, level, expected)
 
 def test_provider_format_inheritance_and_model_override(tmp_path):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"format": "qwen", "efforts": {"off": None, "on": None}}, provider_format="deepseek")
-    activate(h.client, "on")
+    activate(h, "on")
     assert chat(h.client).status_code == 200
     assert h.requests[-1]["body"]["enable_thinking"] is True
 
 
-def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
-    h = harness(tmp_path)
-    activate(h.client)
-    declare(h.client, {"efforts": {"off": None, "high": "high"}})
-    activate(h.client, "high")
-    conn = connect(h.app.state.settings.db_path)
-    with conn:
-        conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'", (json.dumps({"reasoning": {"efforts": {"off": None, "low": "low"}}}),))
-    # 自包含 JSON 生效后，活动图内嵌运行配置优先；外部改库要产生「陈旧快照」必须
-    # 让活动图回到旧图形态（无内嵌运行配置），运行配置才以数据库为事实源。
-    repo = h.app.state.graph_repo
-    active = repo.active()
-    repo.update(replace(active, runtime=None),
-                base_document_sha256=active.document_sha256)
-    stale_tree = h.app.state.snapshot.tree
-    with pytest.raises(GraphStorageError):
-        h.app.state.publisher.refresh(conn)
-    assert h.app.state.snapshot.tree is stale_tree
-    input_tokens, context_tokens = read_jev_window(conn)
-    h.app.state.snapshot = build_snapshot(
-        tree=stale_tree,
-        backends=load_backends(conn),
-        time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
-        jev=JevConfigRepo(conn).load(),
-        capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
-        jev_input_tokens=input_tokens,
-        jev_context_tokens=context_tokens,
-        compiled=compile_graph(stale_tree.root),
-    )
-    conn.close()
-    response = chat(h.client, reasoning_effort="client")
-    assert response.status_code == 200
-    assert response.headers["x-sr-reasoning-warning"] == "unsupported"
-    assert h.requests[-1]["body"]["reasoning_effort"] == "client"
-
-
 def test_streaming_request_injects_reasoning_and_releases(tmp_path):
     h = harness(tmp_path, streaming=True)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"efforts": {"off": None, "high": "high"}})
-    activate(h.client, "high")
+    activate(h, "high")
     response = chat(h.client, stream=True)
     assert response.status_code == 200
     assert response.headers["x-sr-reasoning"] == "high"
     assert response.text == "data: hi\n\n"
     assert h.requests[-1]["body"]["reasoning_effort"] == "high"
-    assert h.app.state.balancer.inflight("qwen3-8b") == 0
+    # 公开 /v1 是 Auto 路由：活动图的 tree.id 为 default-tree。
+    assert h.app.state.balancer.inflight(
+        "qwen3-8b", scope=tree_scope("default-tree")) == 0

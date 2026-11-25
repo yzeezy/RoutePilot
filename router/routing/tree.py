@@ -44,12 +44,33 @@ class RoutingTree:
     name: str
     enabled: bool
     root: GraphRoot
+    runtime: GraphRuntime
+    departments: tuple[str, ...] = ()
+    default: bool = False
     sticky: Sticky = Sticky()
     timezone: str = "Asia/Shanghai"
-    runtime: GraphRuntime | None = None
     tree_revision: str = ""
     updated_at: str = ""
     document_sha256: str = ""
+
+
+def _departments_from_dict(raw) -> tuple[str, ...]:
+    """唯一的部门规范化入口：去空白、去重（重复即拒绝）、排序后返回 tuple。"""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("departments must be a list of strings")
+    values = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise ValueError("departments must be a list of strings")
+        value = item.strip()
+        if not value or len(value) > 64 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            raise ValueError("department is empty, too long, or contains control characters")
+        if value in values:
+            raise ValueError(f"duplicate department: {value}")
+        values.add(value)
+    return tuple(sorted(values))
 
 
 def _sticky_from_dict(raw) -> Sticky:
@@ -73,23 +94,30 @@ def tree_from_dict(raw) -> RoutingTree:
     reject_unknown_fields(
         "tree",
         raw,
-        {"id", "name", "enabled", "timezone", "sticky", "root", "canvas", "tree_revision",
-         "updated_at", "document_sha256", *RUNTIME_FIELDS},
+        {"id", "name", "enabled", "default", "departments", "timezone", "sticky", "root",
+         "canvas", "tree_revision", "updated_at", "document_sha256", *RUNTIME_FIELDS},
     )
     runtime_fields = set(raw) & RUNTIME_FIELDS
-    if runtime_fields and runtime_fields != RUNTIME_FIELDS:
+    if runtime_fields != RUNTIME_FIELDS:
         raise ValueError("runtime fields must appear together")
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
+    default = raw.get("default", False)
+    if not isinstance(default, bool):
+        raise ValueError("default must be a boolean")
+    if default and not enabled:
+        raise ValueError("default graph must be enabled")
     return RoutingTree(
         id=text_field(raw.get("id"), "tree id"),
         name=optional_text_field(raw.get("name", ""), "tree name"),
         enabled=enabled,
         root=graph_from_dict(raw.get("root"), raw.get("canvas")),
+        departments=_departments_from_dict(raw.get("departments")),
+        default=default,
         sticky=_sticky_from_dict(raw.get("sticky")),
         timezone=text_field(raw.get("timezone", "Asia/Shanghai"), "timezone"),
-        runtime=runtime_from_dict(raw) if runtime_fields else None,
+        runtime=runtime_from_dict(raw),
         tree_revision=optional_text_field(raw.get("tree_revision", ""), "tree_revision"),
         updated_at=optional_text_field(raw.get("updated_at", ""), "updated_at"),
         document_sha256=optional_text_field(raw.get("document_sha256", ""), "document_sha256"),
@@ -101,6 +129,8 @@ def tree_storage_dict(tree: RoutingTree) -> dict:
         "id": tree.id,
         "name": tree.name,
         "enabled": tree.enabled,
+        "default": tree.default,
+        "departments": list(tree.departments),
         "timezone": tree.timezone,
         "sticky": {"enabled": tree.sticky.enabled, "ttl_seconds": tree.sticky.ttl_seconds},
         "root": graph_to_dict(tree.root),
@@ -108,19 +138,18 @@ def tree_storage_dict(tree: RoutingTree) -> dict:
     canvas = canvas_to_dict(tree.root)
     if canvas:
         document["canvas"] = canvas
-    if tree.runtime is not None:
-        document.update(runtime_to_dict(tree.runtime))
+    document.update(runtime_to_dict(tree.runtime))
     return document
 
 
 def tree_behavior_dict(tree: RoutingTree) -> dict:
     document = {
+        "departments": list(tree.departments),
         "timezone": tree.timezone,
         "sticky": {"enabled": tree.sticky.enabled, "ttl_seconds": tree.sticky.ttl_seconds},
         "root": graph_behavior_dict(tree.root),
     }
-    if tree.runtime is not None:
-        document.update(runtime_behavior_dict(tree.runtime))
+    document.update(runtime_behavior_dict(tree.runtime))
     return document
 
 

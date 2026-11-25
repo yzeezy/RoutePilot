@@ -55,15 +55,6 @@ function nodeName(node, graph) {
   }
 }
 
-function strategyLabel(value) {
-  const strategy = value || 'least_inflight';
-  const key = strategy === 'least_inflight'
-    ? 'cv.strategy.least_inflight'
-    : 'cv.strategy.' + strategy;
-  const label = t(key);
-  return label === key ? strategy : label;
-}
-
 function portHTML(node, port, options) {
   if (!port) return '';
   const opts = options || {};
@@ -109,14 +100,18 @@ function slotRow(graph, node, port) {
   }
   const kind = RTGraph.edgeType(edge, graph);
   const editable = canEditCondition(edge, graph);
-  const conditionControl = editable
-    ? '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
-      ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
-      ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
-      esc(conditionText(graph, edge)) + '</button>'
-    : '<span class="rtc-cond is-static" data-start-condition="' + esc(edge.id) + '" tabindex="-1">' +
-      esc(conditionText(graph, edge)) + '</span>';
+  /* 开始节点的默认边没有条件文案（conditionText 为空）：不渲染条件标记，
+     槽位行只留来源与状态；行本身带 tabindex="-1"，供条件浮层关闭后回焦。 */
+  const condition = conditionText(graph, edge);
+  const conditionControl = !condition ? ''
+    : editable
+      ? '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
+        ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
+        ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
+        esc(condition) + '</button>'
+      : '<span class="rtc-cond is-static">' + esc(condition) + '</span>';
   return '<div class="rtc-slot' + (kind === 'number' ? ' is-num' : '') + '"' +
+    (condition ? '' : ' tabindex="-1"') +
     ' data-slot="' + esc(port.id) + '" data-edge="' + esc(edge.id) + '">' +
     portHTML(node, port, { side: 'left' }) +
     '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +
@@ -281,9 +276,8 @@ function targetCard(graph, node) {
     '</div>' +
     '<div class="rtc-tbody">' +
     (roles.length ? '<div class="rtc-tmeta rtc-tmeta--roles">' + roles.join('') + '</div>' : '') +
-    '<div class="rtc-tmeta"><span>' + esc(models.join(' / ') || t('cv.card.noModels')) + '</span></div>' +
-    '<div class="rtc-tmeta"><span>' + esc(strategyLabel(node.strategy)) + '</span>' +
-    (node.capability ? '<span class="rtc-tcap-inline" title="' + esc(node.capability) + '">' + esc(snippet(node.capability, 38)) + '</span>' : '') +
+    '<div class="rtc-tmeta"><span>' + esc(models.join(' / ') || t('cv.card.noModels')) + '</span>' +
+    (models.length > 1 ? '<span>' + esc(t('cv.card.random')) + '</span>' : '') +
     '</div>' +
     '</div>' +
     slotsHTML(graph, node) +
@@ -318,7 +312,6 @@ export {
   render,
   nodeCard,
   nodeName,
-  strategyLabel,
   portHTML,
   snippet,
   esc as escape

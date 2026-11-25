@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from dataclasses import replace
+from urllib.parse import quote
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
-from router.api.routes_v1 import router
+from router.api.routes_v1 import router, run_chat_completion
 from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
@@ -29,10 +31,12 @@ from router.routing.tree import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
-from router.routing.snapshot import build_snapshot
+from router.routing.snapshot import assemble_snapshot_set, build_snapshot
 from router.store.db import connect, migrate
+from router.store.repositories import seed_default
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.catalog import Backend
+from router.upstream.runtime_keys import runtime_model_key, tree_scope
 from tests.routing_fixtures import tree_dict
 
 
@@ -43,6 +47,8 @@ JEV_SETTINGS = JevSettings(
 SELECTION_VALUES = {"target", "sticky", "otherwise", "error_fallback"}
 MODELS = ("fast", "strong", "power", "strong-a", "strong-b", "safe")
 CAPABILITIES = {model: f"{model} 能力" for model in MODELS}
+#: ``make_app`` 默认图 tree.id = "main"；Auto 调度的作用域必须与之一致。
+MAIN_SCOPE = tree_scope("main")
 
 
 class RecordingBalancer(LoadBalancer):
@@ -52,9 +58,11 @@ class RecordingBalancer(LoadBalancer):
         super().__init__(breaker)
         self.calls = []
 
-    def acquire(self, models, *, preferred=None, dry_run=False):
-        self.calls.append({"models": list(models), "preferred": preferred, "dry_run": dry_run})
-        return super().acquire(models, preferred=preferred, dry_run=dry_run)
+    def acquire(self, models, *, preferred=None, dry_run=False, scope=''):
+        self.calls.append({"models": list(models), "preferred": preferred,
+                           "dry_run": dry_run, "scope": scope})
+        return super().acquire(
+            models, preferred=preferred, dry_run=dry_run, scope=scope)
 
 
 class BlockingTransport(httpx.AsyncBaseTransport):
@@ -270,19 +278,22 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
         )
         for model in MODELS
     }
-    tree = None
     if active:
         tree = tree_from_dict(tree_dict(
             "main",
             root=root or switch_graph(),
             sticky=sticky or {"enabled": False, "ttl_seconds": 1800},
+            enabled=True, default=True,
         ))
-    app.state.snapshot = build_snapshot(
-        tree=tree, backends=backends,
-        time_periods=[] if time_periods is None else time_periods,
-        jev=JEV_SETTINGS, capabilities=CAPABILITIES,
-        compiled=compile_graph(tree.root) if tree is not None else None,
-    )
+        snapshot = build_snapshot(
+            tree=tree, backends=backends,
+            time_periods=[] if time_periods is None else time_periods,
+            jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+            compiled=compile_graph(tree.root),
+        )
+        app.state.snapshot_set = assemble_snapshot_set([snapshot], fingerprint="test")
+    else:
+        app.state.snapshot_set = assemble_snapshot_set([], fingerprint="empty")
     app.include_router(router, prefix="/v1")
     return app
 
@@ -327,11 +338,11 @@ class Harness:
         return upstream_ok(request)
 
 
-async def post(app, body=None, *, headers=None):
+async def post(app, body=None, *, headers=None, path="/v1/chat/completions"):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://router.test",
     ) as client:
-        return await client.post("/v1/chat/completions", json=body or payload(), headers=headers)
+        return await client.post(path, json=body or payload(), headers=headers)
 
 
 def recent(app):
@@ -369,15 +380,17 @@ def test_selected_target_uses_real_systemone_chain(tmp_path):
         assert record["waves"] == 1
         assert record["answers"]["q"]["probabilities"]["fast"] == pytest.approx(0.9)
         assert record["route_label"] == {"zh": "目标命中", "en": "Target selected"}
-        assert [pair[0]["en"] for pair in record["metrics"]] == ["Upstream", "Routing", "Total", "Waves"]
-        assert record["metrics"][0][1] == 200
-        assert record["metrics"][3][1] == 1
+        assert [pair[0]["en"] for pair in record["metrics"]] == [
+            "Decision time", "Decision model time", "Waves"]
+        assert record["metrics"][0][1].endswith("ms")
+        assert record["metrics"][2][1] == 1
+        assert record["upstream_status"] == 200
         assert record["fields"][0] == [{"zh": "请求 ID", "en": "Request ID"}, record["id"]]
         assert [event["event"] for event in record["trace"]].count("request_outcome") == 1
         assert record["trace"][-1]["phase"] == "outcome"
         assert record["trace"][-1]["tone"] == "hit"
         assert len(app.state.requestlog.recent_requests()) == 1
-        assert app.state.balancer.inflight("fast") == 0
+        assert app.state.balancer.inflight("fast", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -411,7 +424,7 @@ def test_numeric_and_merges_two_questions_into_one_systemone_call(tmp_path):
         assert row["jev_choice"] == "strong"
         assert set(LOG_COLUMNS) & {"answers", "trace", "text", "route_label", "metrics", "fields"} == set()
         assert "answers" in recent(app) and "trace" in recent(app)
-        assert app.state.balancer.inflight("power") == 0
+        assert app.state.balancer.inflight("power", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -423,11 +436,13 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
         response = await post(app)
         assert response.status_code == 200
         assert response.headers["x-sr-selection"] == "target"
-        assert response.headers["x-sr-model"] == "strong-a"
+        # strong-target 有两个模型：选择是随机的，只断言落在该目标内。
+        model = response.headers["x-sr-model"]
+        assert model in ("strong-a", "strong-b")
         assert [list(request["questions"]) for request in har.jev_requests] == [
             ["q-cap"], ["q-clarify"],
         ]
-        assert har.upstream_models == ["strong-a"]
+        assert har.upstream_models == [model]
         record = recent(app)
         assert record["waves"] == 2
         assert record["jev_choice"] == "strong"
@@ -442,7 +457,7 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
         conn.close()
         assert row["waves"] == 2
         assert "answers" not in columns and "trace" not in columns
-        assert app.state.balancer.inflight("strong-a") == 0
+        assert app.state.balancer.inflight(model, scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -489,7 +504,7 @@ def test_missing_answer_key_uses_error_fallback(tmp_path):
         assert record["waves"] == 1
         failed = [event for event in record["trace"] if event["event"] == "wave"]
         assert failed[0]["failed"] is True and failed[0]["error"]
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -534,11 +549,12 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         headers = {"x-sr-session-id": "session-1"}
         first = await post(app, headers=headers)
         assert first.status_code == 200
-        assert first.headers["x-sr-model"] == "strong-a"
+        model = first.headers["x-sr-model"]
+        assert model in ("strong-a", "strong-b")
         assert first.headers["x-sr-selection"] == "target"
         assert app.state.balancer.calls[-1]["preferred"] is None
-        assert app.state.balancer.inflight("strong-a") == 0
-        first_revision = app.state.snapshot.tree_revision
+        assert app.state.balancer.inflight(model, scope=MAIN_SCOPE) == 0
+        first_revision = app.state.snapshot_set.default_snapshot.tree_revision
 
         # 仅移动节点（canvas 属于纯布局字段）：behavior revision 不变。
         moved = copy.deepcopy(switch_graph())
@@ -549,24 +565,26 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         moved_tree = tree_from_dict(tree_dict(
             "main", root=moved, canvas=moved_canvas,
             sticky={"enabled": True, "ttl_seconds": 1800},
+            enabled=True, default=True,
         ))
         moved_snapshot = build_snapshot(
             tree=moved_tree,
-            backends=app.state.snapshot.backends, time_periods=[],
+            backends=app.state.snapshot_set.default_snapshot.backends, time_periods=[],
             jev=JEV_SETTINGS, capabilities=CAPABILITIES,
             compiled=compile_graph(moved_tree.root),
         )
         assert moved_snapshot.tree_revision == first_revision
-        app.state.snapshot = moved_snapshot
+        app.state.snapshot_set = assemble_snapshot_set(
+            [moved_snapshot], fingerprint="moved")
 
         second = await post(app, headers=headers)
         assert second.status_code == 200
-        assert second.headers["x-sr-model"] == "strong-a"
+        assert second.headers["x-sr-model"] == model
         assert second.headers["x-sr-selection"] == "sticky"
         # 第二次请求仍先执行被激活的问题，再做 preferred 调度。
         assert [list(request["questions"]) for request in har.jev_requests] == [["q"], ["q"]]
-        assert app.state.balancer.calls[-1]["preferred"] == "strong-a"
-        assert har.upstream_models == ["strong-a", "strong-a"]
+        assert app.state.balancer.calls[-1]["preferred"] == model
+        assert har.upstream_models == [model, model]
         record = recent(app)
         assert record["sticky_hit"] == 1
         assert record["selection_reason"] == "sticky"
@@ -580,15 +598,17 @@ def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(tmp_path, har, root=priority_graph())
         for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure("power")
-        assert app.state.breaker.is_open("power") is True
+            app.state.breaker.failure(runtime_model_key(MAIN_SCOPE, "power"))
+        assert app.state.breaker.is_open(
+            runtime_model_key(MAIN_SCOPE, "power")) is True
+        assert app.state.breaker.is_open("power") is False
         response = await post(app)
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_available_backend"
         # p1 power-target 熔断后直接 503，不静默改选 p2 strong-target 上游。
         assert har.upstream_models == []
-        assert app.state.balancer.inflight("power") == 0
-        assert app.state.balancer.inflight("strong-a") == 0
+        assert app.state.balancer.inflight("power", scope=MAIN_SCOPE) == 0
+        assert app.state.balancer.inflight("strong-a", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "routing_error"
         assert record["error_class"] == "no_available_backend"
@@ -636,13 +656,13 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         assert record["error_class"] == "no_active_tree"
         failure = record["trace"][-1]
         assert {key: failure[key] for key in ("event", "stage", "error_class", "message")} == {
-            "event": "routing_error", "stage": "graph",
+            "event": "routing_error", "stage": "snapshot",
             "error_class": "no_active_tree", "message": "no routing tree is enabled",
         }
         assert failure["phase"] == "routing_error"
         assert failure["label"] == {"zh": "路由中止", "en": "Routing stopped"}
         facts = failure["facts"]
-        assert facts[0] == [{"zh": "阶段", "en": "Stage"}, "graph"]
+        assert facts[0] == [{"zh": "阶段", "en": "Stage"}, "snapshot"]
         assert facts[1] == [{"zh": "原因", "en": "Reason"}, "no_active_tree"]
         assert facts[2][0] == {"zh": "消息", "en": "Message"}
         assert facts[2][1]
@@ -653,6 +673,10 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         assert record["node_labels"] == {}
         assert record["model"] is None
         assert record["target_id"] is None
+        assert record["tree_id"] is None
+        assert record["tree_revision"] is None
+        assert record["snapshot_revision"] is None
+        assert record["jev_model"] is None
         assert record["selection_reason"] is None
         assert record["policy_path"] is None
         assert record["fallback_reason"] is None
@@ -702,7 +726,9 @@ def test_no_candidate_schedule_failure_preserves_fallback_target(tmp_path):
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(tmp_path, har, root=no_target_graph())
         for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure("safe")
+            app.state.breaker.failure(runtime_model_key(MAIN_SCOPE, "safe"))
+        # 熔断只作用于 Auto 图的运行键；裸键属于固定模型直连，必须保持关闭。
+        assert app.state.breaker.is_open("safe") is False
 
         response = await post(app)
 
@@ -762,7 +788,7 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
 def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
-        app.state.snapshot = None
+        app.state.snapshot_set = None
         response = await post(app)
 
         assert response.status_code == 503
@@ -771,6 +797,7 @@ def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
         assert record["node_labels"] == {}
         assert record["trace"][-1]["stage"] == "snapshot"
         assert record["trace"][-1]["error_class"] == "no_valid_snapshot"
+        assert record["trace"][-1]["message"] == "no valid snapshot set"
 
     asyncio.run(scenario())
 
@@ -792,7 +819,7 @@ def test_time_event_stays_initial_when_no_period_condition_ran(tmp_path):
         assert time_event["event"] == "time"
         assert time_event["phase"] == "initial"
         assert time_event["label"] == {"zh": "初始计算", "en": "Initial evaluation"}
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -813,7 +840,7 @@ def test_time_event_is_period_when_a_real_period_condition_ran(tmp_path):
         assert condition["source"] == "periods"
         assert condition["value"] is True
         assert condition["phase"] == "period"
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -859,13 +886,14 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert response.status_code == 200
         assert b"[DONE]" in response.content
         assert jev_calls == []
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "completed"
         assert record["total_tokens"] == 3
         assert record["answers"] == {}
         assert record["trace"][-1]["event"] == "request_outcome"
-        assert record["fields"][-1][1] == 3
+        # 上游用量仍保存在机器字段里，但不再进入路由控制台的展示字段。
+        assert "Total tokens" not in [pair[0]["en"] for pair in record["fields"]]
 
     asyncio.run(scenario())
 
@@ -909,11 +937,25 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
         # 上游响应恰好关闭一次，租约恰好释放一次（未移交 _relay，也没有 double release）。
         assert closes == [True]
         assert released == ["safe"]
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "upstream_error"
         assert record["error_class"] == "upstream_error"
-        assert record["metrics"][0][1] == 503
+        assert record["upstream_status"] == 503
+        assert [pair[0]["en"] for pair in record["metrics"]] == [
+            "Decision time", "Decision model time", "Waves"]
+
+        # 熔断键必须带图作用域：再补两次 5xx 达到阈值（threshold=3），作用域键
+        # 打开而裸模型键不打开；stream()/_relay 回退到裸 ``model`` 键时首条断言
+        # 就会失败。每条 5xx 仍各自关闭上游响应、释放租约，结束后 inflight 归零。
+        for _ in range(2):
+            assert (await post(app, payload(stream=True))).status_code == 502
+        assert app.state.breaker.is_open(
+            runtime_model_key(tree_scope("main"), "safe")) is True
+        assert app.state.breaker.is_open("safe") is False
+        assert closes == [True, True, True]
+        assert released == ["safe", "safe", "safe"]
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -994,7 +1036,7 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
                     break
             # 第一个 SSE 分片已发出，第二个仍被上游 gate 挡住：租约必须被持有。
             assert first == b"data: first\n\n"
-            assert app.state.balancer.inflight("safe") == 1
+            assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 1
             assert released == []
             gate.set()
             chunks = [first]
@@ -1013,7 +1055,7 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
         assert b"".join(chunks) == b"data: first\n\ndata: second\n\n"
         assert closes == [True]
         assert released == ["safe"]
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         assert recent(app)["outcome_state"] == "completed"
 
     asyncio.run(scenario())
@@ -1048,7 +1090,7 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
         app = make_app(tmp_path, handler, root=direct_graph())
         response = await post(app)
         assert response.status_code == 502
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "upstream_error"
         assert record["trace"][-1]["event"] == "request_outcome"
@@ -1069,7 +1111,7 @@ def test_cancellation_during_upstream_records_terminal_state_and_releases(tmp_pa
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         assert recent(app)["outcome_state"] == "cancelled"
 
     asyncio.run(scenario())
@@ -1114,9 +1156,10 @@ def test_stream_disconnect_does_not_count_as_upstream_failure(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=Breaker())
-        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
-                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
-                                 release=lambda: released.append(True))
+        generator = proxy._relay(
+            response, model="safe", breaker_key="safe", outcome=outcome,
+            is_disconnected=None, backend=backend, upstream_started=0.0,
+            upstream_ms=1.0, release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
         await generator.aclose()
         assert response.closed is True
@@ -1153,9 +1196,10 @@ def test_mid_stream_upstream_error_counts_in_breaker(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=CircuitBreaker(threshold=1))
-        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
-                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
-                                 release=lambda: released.append(True))
+        generator = proxy._relay(
+            response, model="safe", breaker_key="safe", outcome=outcome,
+            is_disconnected=None, backend=backend, upstream_started=0.0,
+            upstream_ms=1.0, release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
         with pytest.raises(httpx.ReadError):
             await generator.__anext__()
@@ -1197,9 +1241,10 @@ def test_stream_generator_closes_response_and_releases_lease_once(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=Breaker())
-        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
-                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
-                                 release=lambda: released.append(True))
+        generator = proxy._relay(
+            response, model="safe", breaker_key="safe", outcome=outcome,
+            is_disconnected=None, backend=backend, upstream_started=0.0,
+            upstream_ms=1.0, release=lambda: released.append(True))
         chunks = [chunk async for chunk in generator]
         assert chunks == [b"data: a\n\n", b"data: b\n\n"]
         assert response.closes == 1
@@ -1250,3 +1295,318 @@ def test_real_request_logs_a_graph_snapshot_index(tmp_path):
         assert stored is not None and stored[0] == record["graph_snapshot_id"]
 
     asyncio.run(scenario())
+
+
+# ── standalone data plane: default graph + department header ───────────
+
+
+def encode_department(value):
+    return quote(value, safe='')
+
+
+def add_department_graph(app, *, department='财务部', tree_id='finance'):
+    """把带部门的启用图装配进 app 的路由集（默认图保持 main）。"""
+    base = app.state.snapshot_set.default_snapshot
+    tree = tree_from_dict(tree_dict(
+        tree_id, root=switch_graph(), departments=[department],
+        enabled=True, default=False,
+        sticky={'enabled': False, 'ttl_seconds': 1800},
+    ))
+    snapshot = build_snapshot(
+        tree=tree, backends=base.backends, time_periods=[],
+        jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+        compiled=compile_graph(tree.root),
+    )
+    app.state.snapshot_set = assemble_snapshot_set(
+        [base, snapshot], fingerprint='departments')
+    return app
+
+
+def make_admin_chat_app(tmp_path, handler, *, allow_department_header=True, root=None):
+    """真实执行器 + 管理端测试对话路由（正式路由在 Task 7 接入）。"""
+    app = make_app(tmp_path, handler, root=root)
+    conn = connect(app.state.settings.db_path)
+    try:
+        seed_default(conn)
+    finally:
+        conn.close()
+
+    @app.post('/admin/test/chat/completions')
+    async def admin_test_chat(request: Request):
+        conn = connect(app.state.settings.db_path)
+        try:
+            return await run_chat_completion(
+                request, use_requested_model=True, conn=conn,
+                allow_department_header=allow_department_header,
+            )
+        finally:
+            conn.close()
+
+    return app
+
+
+def test_public_v1_rejects_client_department_header(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500),
+                       root=direct_graph())
+        response = await post(
+            app,
+            {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]},
+            headers={'x-sr-department': encode_department('财务部')},
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {'error': {'message': 'department_header_not_allowed'}}
+
+    asyncio.run(scenario())
+
+
+def test_public_v1_rejects_empty_department_header_even_for_a_named_model(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500),
+                       root=direct_graph())
+        response = await post(
+            app,
+            {'model': 'fast', 'messages': [{'role': 'user', 'content': '你好'}]},
+            headers={'x-sr-department': ''},
+        )
+
+        # 公开数据面不读取请求模型：只要出现 Header 就拒绝，与 model 无关。
+        assert response.status_code == 400
+        assert response.json() == {'error': {'message': 'department_header_not_allowed'}}
+
+    asyncio.run(scenario())
+
+
+def test_public_v1_uses_default_graph_and_emits_selection_headers(tmp_path):
+    async def scenario():
+        har = Harness({'q': choice(fast=0.9, strong=0.1)})
+        app = make_app(tmp_path, har, root=switch_graph())
+        response = await post(
+            app, {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-graph-selection'] == 'default'
+        assert response.headers['x-sr-tree-id'] == 'main'
+
+    asyncio.run(scenario())
+
+
+def test_public_v1_never_selects_a_department_graph(tmp_path):
+    async def scenario():
+        har = Harness({'q': choice(fast=0.9, strong=0.1)})
+        app = add_department_graph(make_app(tmp_path, har, root=switch_graph()))
+        response = await post(
+            app, {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-graph-selection'] == 'default'
+        assert response.headers['x-sr-tree-id'] == 'main'
+        assert recent(app)['tree_id'] == 'main'
+
+    asyncio.run(scenario())
+
+
+def test_auto_stream_emits_default_graph_selection_headers(tmp_path):
+    async def scenario():
+        body = b'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+
+        class Chunks(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield body
+
+        def handler(request):
+            if request.url.host == 'jev.test':
+                raise AssertionError('direct target must skip JEV')
+            return httpx.Response(
+                200, headers={'content-type': 'text/event-stream'}, stream=Chunks())
+
+        app = make_app(tmp_path, handler, root=direct_graph())
+        response = await post(app, payload(stream=True))
+
+        assert response.status_code == 200
+        assert response.headers['x-sr-graph-selection'] == 'default'
+        assert response.headers['x-sr-tree-id'] == 'main'
+
+    asyncio.run(scenario())
+
+
+def test_missing_default_graph_is_a_no_default_tree_failure(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500),
+                       root=direct_graph())
+        app.state.snapshot_set = replace(
+            app.state.snapshot_set, default_tree_id=None)
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json() == {'error': {'message': 'no_default_tree'}}
+        record = recent(app)
+        assert record['outcome_state'] == 'routing_error'
+        assert record['error_class'] == 'no_default_tree'
+        failure = record['trace'][-1]
+        assert failure['stage'] == 'snapshot'
+        assert failure['error_class'] == 'no_default_tree'
+        assert failure['message'] == 'no default routing tree is enabled'
+        # 选图失败发生在快照装配前：失败账本必须以 snapshot=None 安全落表。
+        assert record['node_labels'] == {}
+        assert record['model'] is None
+        assert record['tree_id'] is None
+        assert record['tree_revision'] is None
+        assert record['snapshot_revision'] is None
+        assert record['jev_model'] is None
+
+    asyncio.run(scenario())
+
+
+def test_admin_test_chat_accepts_encoded_department_header(tmp_path):
+    async def scenario():
+        har = Harness({'q': choice(fast=0.9, strong=0.1)})
+        app = add_department_graph(make_admin_chat_app(tmp_path, har))
+        response = await post(
+            app,
+            {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]},
+            headers={'x-sr-department': encode_department('财务部')},
+            path='/admin/test/chat/completions',
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-tree-id'] == 'finance'
+        assert response.headers['x-sr-graph-selection'] == 'department'
+        assert response.headers['x-sr-selection'] == 'target'
+        record = recent(app)
+        assert record['tree_id'] == 'finance'
+
+    asyncio.run(scenario())
+
+
+def test_admin_test_chat_rejects_malformed_department_header(tmp_path):
+    async def scenario():
+        app = make_admin_chat_app(tmp_path, Harness({}))
+        body = {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]}
+        for raw in ('%zz', '%E4'):
+            response = await post(
+                app, body, headers={'x-sr-department': raw},
+                path='/admin/test/chat/completions')
+            assert response.status_code == 400
+            assert response.json() == {'error': {'message': 'invalid_department'}}
+
+    asyncio.run(scenario())
+
+
+def test_same_model_failure_in_main_does_not_block_finance(tmp_path):
+    async def scenario():
+        state = {'fail': True, 'calls': []}
+
+        def handler(request):
+            if request.url.host.endswith('.test') and request.url.path.endswith('/chat/completions'):
+                state['calls'].append(request.url.host)
+                if state['fail']:
+                    return httpx.Response(500)
+                return upstream_ok(request)
+            return httpx.Response(200, json={'answers': {}})
+
+        app = make_admin_chat_app(tmp_path, handler, root=direct_graph())
+        base = app.state.snapshot_set.default_snapshot
+        # 部门图与默认图使用同一直连结构、同一 safe 逻辑模型和同一运行目录。
+        tree = tree_from_dict(tree_dict(
+            'finance', root=direct_graph(), departments=['财务部'],
+            enabled=True, default=False))
+        finance = build_snapshot(
+            tree=tree, backends=base.backends,
+            time_periods=[], jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+            compiled=compile_graph(tree.root))
+        app.state.snapshot_set = assemble_snapshot_set(
+            [base, finance], fingerprint='same-model')
+
+        # 公开默认图持续失败，直到 main:safe 对应的电路打开。
+        for _ in range(app.state.breaker.threshold):
+            response = await post(app, payload())
+            assert response.status_code == 502
+        main_key = runtime_model_key(MAIN_SCOPE, 'safe')
+        assert app.state.breaker.is_open(main_key) is True
+        # 熔断只落在 main 的运行键上：裸键属于固定模型直连，不能被 Auto 污染。
+        assert app.state.breaker.is_open('safe') is False
+
+        state['fail'] = False
+        before = len(state['calls'])
+        response = await post(
+            app, {**payload(), 'model': 'auto'},
+            headers={'x-sr-department': encode_department('财务部')},
+            path='/admin/test/chat/completions')
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-tree-id'] == 'finance'
+        assert len(state['calls']) == before + 1, 'finance was blocked before its upstream call'
+
+        # 财务图成功不能重置 main 的电路；默认图再次请求仍应在调度前阻断。
+        before = len(state['calls'])
+        response = await post(app, payload())
+        assert response.status_code == 503
+        assert response.json()['error']['message'] == 'no_available_backend'
+        assert len(state['calls']) == before, 'main circuit should remain open'
+
+    asyncio.run(scenario())
+
+
+def test_fixed_model_direct_does_not_require_a_route_set(tmp_path):
+    async def scenario():
+        app = make_admin_chat_app(
+            tmp_path, lambda request: httpx.Response(200, json={'choices': []}))
+        body = {'model': 'qwen3-8b', 'messages': [{'role': 'user', 'content': '直连'}]}
+        # 空路由集（无默认图）与未初始化路由集都不影响固定模型直连。
+        for route_set in (assemble_snapshot_set([], fingerprint='empty'), None):
+            app.state.snapshot_set = route_set
+            response = await post(app, body, path='/admin/test/chat/completions')
+            assert response.status_code == 200, response.text
+            assert response.headers['x-sr-model'] == 'qwen3-8b'
+            assert response.headers['x-sr-selection'] == 'direct'
+            assert 'x-sr-graph-selection' not in response.headers
+            assert 'x-sr-tree-id' not in response.headers
+        record = recent(app)
+        assert record['decision'] == 'test'
+        assert record['selection_reason'] == 'direct'
+        assert record['tree_id'] is None
+        assert record['snapshot_revision'] is None
+
+    asyncio.run(scenario())
+
+
+def test_admin_fixed_model_department_header_is_ignored(tmp_path):
+    async def scenario():
+        app = add_department_graph(make_admin_chat_app(
+            tmp_path, lambda request: httpx.Response(200, json={'choices': []})))
+        response = await post(
+            app,
+            {'model': 'qwen3-8b', 'messages': [{'role': 'user', 'content': '直连'}]},
+            headers={'x-sr-department': encode_department('财务部')},
+            path='/admin/test/chat/completions',
+        )
+
+        # 固定模型直连是目录测试：可信 Header 允许出现，但不参与选图/响应头。
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-selection'] == 'direct'
+        assert 'x-sr-graph-selection' not in response.headers
+        assert 'x-sr-tree-id' not in response.headers
+
+    asyncio.run(scenario())
+
+
+def test_decode_department_accepts_encoded_unicode():
+    from router.api.routes_v1 import decode_department
+
+    assert decode_department(None) == ''
+    assert decode_department('') == ''
+    assert decode_department(encode_department(' 财务部 ')) == '财务部'
+    # 先 strip 再查控制字符（brief 的实现顺序）：纯首尾换行/制表符等价于未声明。
+    assert decode_department('%0A') == ''
+    assert decode_department('%20%09%20') == ''
+
+
+@pytest.mark.parametrize('raw', [
+    '%', '%zz', '%E4', 'a' * 769, 'x' * 65, 'a%00b', '%7F', 'a%01b',
+])
+def test_decode_department_rejects_malformed_values(raw):
+    from router.api.routes_v1 import decode_department
+
+    with pytest.raises(ValueError, match='invalid_department'):
+        decode_department(raw)

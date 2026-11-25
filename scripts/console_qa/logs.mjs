@@ -35,7 +35,7 @@ test('calculation-log renders staged process from a real request', async () => {
   await page.waitForSelector('.lg-item.open .lg-rail');
 
   const open = page.locator('.lg-item.open');
-  /* 图 v3 展示契约：只渲染 trace 里实际出现的阶段，阶段 id 即引擎的 phase。 */
+  /* 计算日志展示契约：只渲染 trace 里实际出现的阶段，阶段 id 即引擎的 phase。 */
   const phases = (await open.locator('.lg-stage-name small').allInnerTexts())
     .map(text => text.split(' · ')[0]);
   assert.deepEqual(phases,
@@ -44,6 +44,29 @@ test('calculation-log renders staged process from a real request', async () => {
   assert.equal(await open.locator('.lg-status').count(), 1);
   assertIncludes(await open.innerText(), 'power-target');
   assertIncludes(await open.innerText(), 'qwen3.8-flash-sft');
+
+  /* 计算日志只统计决策耗时（routing_ms + jev_ms），不把上游状态或端到端
+     总耗时混进智能路由的口径。 */
+  const labels = await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return {
+      latency: t('logs.stat.latency'), model: t('logs.decisionModel'),
+      hint: t('logs.stat.latencyHint'),
+    };
+  });
+  const kpi = page.locator('#kpis .lg-kpi').last();
+  assertIncludes(await kpi.innerText(), labels.latency);
+  assert.equal(await kpi.getAttribute('title'), labels.hint,
+    'the decision-time KPI does not explain that upstream time is excluded');
+  const metrics = (await open.locator('.lg-detail-metrics').innerText()).replace(/\s+/g, ' ');
+  assertIncludes(metrics, labels.latency);
+  assertIncludes(metrics, labels.model);
+  assert.equal(/总耗时|Total time|上游状态|Upstream status/.test(metrics), false,
+    'expanded metrics still report upstream/end-to-end facts: ' + metrics);
+
+  /* 折叠行的计算路径只画路由决策，不画上游执行结果。 */
+  const chain = (await page.locator('.lg-item .lg-chain').first().innerText()).replace(/\s+/g, ' ');
+  assert.equal(/执行结果/.test(chain), false, 'the collapsed path still includes the execution result');
 });
 
 test('calculation-log-phase-order-matches-engine', async () => {
@@ -104,16 +127,18 @@ test('calculation-log restored row states that detail is absent', async () => {
   try {
     await page.goto(routerBase + '/console/logs.html');
     await page.locator('.lg-row').first().click();
-    /* 图 v3 不再区分「历史记录」：没有 trace 的记录统一显示 traceEmpty。 */
+    /* 计算日志不再区分「历史记录」：没有 trace 的记录统一显示 traceEmpty。 */
     const expected = await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (t('logs.traceEmpty'));
 });
     assertIncludes(await page.locator('.lg-item.open').innerText(), expected);
-    /* 旧日志没有图快照：不能显示快照链接，原文字阶段视图继续可用。 */
-    assert.equal(await page.locator('.lg-item.open .lg-snapshot-link').count(), 0,
-      'a log row without a snapshot still offered a snapshot link');
-    assertIncludes(await page.locator('.lg-item.open .lg-lat').innerText(), '1.20s');
+    /* 旧日志没有图快照：折叠行也不能显示快照按钮，原文字阶段视图继续可用。 */
+    assert.equal(await page.locator('.lg-item[data-id="restored"] .lg-snap-btn').count(), 0,
+      'a log row without a snapshot still offered a snapshot button');
+    /* 耗时列取决策耗时 routing_ms，不是端到端 total_ms。 */
+    assertIncludes(await page.locator('.lg-item[data-id="restored"] .lg-lat').innerText(), '4ms');
+    assertIncludes(await page.locator('.lg-thead').innerText(), '决策耗时');
 } finally {
     await page.unroute(matcher);
 }
@@ -275,7 +300,8 @@ test('calculation-log mobile keeps the main conclusion within the viewport', asy
 
 
 /* 快照被 page.route() 截获后的固定 tree envelope：直接复用示例图，
-   保证节点/边 id 与事件顺序一一对应。 */
+   保证节点/边 id 与事件顺序一一对应。严格契约：tree envelope 必须带完整四字段
+   运行快照（只读回放不会执行，但控制器加载时仍会校验）。 */
 function snapshotTree() {
   return {
     id: 'partial-tree',
@@ -283,7 +309,11 @@ function snapshotTree() {
     timezone: EXAMPLE.timezone,
     sticky: EXAMPLE.sticky,
     root: EXAMPLE_ROOT,
-    canvas: EXAMPLE.canvas
+    canvas: EXAMPLE.canvas,
+    backends: JSON.parse(JSON.stringify(EXAMPLE.backends)),
+    jev: JSON.parse(JSON.stringify(EXAMPLE.jev)),
+    jev_window: JSON.parse(JSON.stringify(EXAMPLE.jev_window)),
+    time_periods: JSON.parse(JSON.stringify(EXAMPLE.time_periods))
   };
 }
 
@@ -515,9 +545,37 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
     stream: false,
   });
   await page.goto(routerBase + '/console/logs.html');
-  await page.locator('.lg-row').first().click();
-  const link = page.locator('.lg-item.open .lg-snapshot-link');
+  /* 快照入口在折叠行上，不需要先展开计算过程。 */
+  const link = page.locator('.lg-item .lg-snap-btn').first();
   await link.waitFor({ state: 'visible' });
+  assert.equal(await page.locator('.lg-item.open').count(), 0,
+    'the snapshot button required expanding the row first');
+  /* 「显眼」是需求本身：入口必须是一个填了底色的按钮，而不是一排灰字。 */
+  const skin = await link.evaluate(element => {
+    const style = getComputedStyle(element);
+    return { background: style.backgroundColor, color: style.color, border: style.borderTopColor };
+  });
+  assert.notEqual(skin.background, 'rgba(0, 0, 0, 0)',
+    'the snapshot entry is not painted as a button');
+  assert.notEqual(skin.color, skin.background, 'the snapshot button text does not contrast with its fill');
+  /* 方框图标会被误认成单选/复选：快照入口不能画任何矩形框。 */
+  assert.equal(await link.locator('svg rect').count(), 0,
+    'the snapshot icon still draws a box that reads as a radio button');
+  /* 表头必须和列内容同向对齐：模型左、决策耗时右。 */
+  const alignment = await page.evaluate(() => {
+    const heads = document.querySelectorAll('.lg-thead span');
+    const row = document.querySelector('.lg-row');
+    return {
+      headModel: getComputedStyle(heads[3]).textAlign,
+      cellModel: getComputedStyle(row.querySelector('.lg-model')).textAlign,
+      headLat: getComputedStyle(heads[4]).textAlign,
+      cellLat: getComputedStyle(row.querySelector('.lg-lat')).textAlign,
+    };
+  });
+  assert.equal(alignment.headModel, alignment.cellModel,
+    'the model header is not aligned with the model column');
+  assert.equal(alignment.headLat, alignment.cellLat,
+    'the decision-time header is not aligned with the decision-time column');
   const href = await link.getAttribute('href');
   assert.match(href, /^\/console\/routing\.html\?request=.+/);
   await Promise.all([page.waitForURL(/routing\.html\?request=/), link.click()]);
@@ -538,6 +596,7 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
       palette: css('#cvPalette'),
       inspector: css('#cvInspector'),
       actions: css('.rtc-actions'),
+      lifecycle: css('#cvLifecycle'),
       tryRow: css('.rtc-try-row'),
       chips: css('#cvTryChips'),
       runButton: css('#cvTryRun'),
@@ -558,7 +617,16 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
   assert.equal(opened.locked, true, 'the snapshot canvas is not locked');
   assert.equal(opened.snapshotMode, true);
   assert.equal(opened.badgeHidden, false, 'the read-only badge is missing');
-  for (const key of ['palette', 'inspector', 'actions', 'chips']) {
+  assert.equal(await page.locator('#cvSnapshotBadge').isVisible(), true,
+    'the snapshot badge is not visible');
+  assert.match(await page.locator('#cvSnapshotBadge').innerText(), /只读|read-only/,
+    'the snapshot badge does not say the replay is read-only');
+  /* No save, enable or editing affordance may survive in snapshot mode. */
+  for (const id of ['cvSave', 'cvEnable', 'cvAutoLayout', 'cvUndo', 'cvTryBtn', 'cvDisable']) {
+    assert.equal(await page.locator('#' + id).isVisible(), false,
+      `snapshot mode still exposes #${id}`);
+  }
+  for (const key of ['palette', 'inspector', 'actions', 'lifecycle', 'chips']) {
     assert.equal(opened[key], 'none', `snapshot mode still shows ${key}`);
   }
   /* 快照问题放回画布原有的试算问题输入位：只读、无运行按钮/图标/样例。 */
@@ -640,7 +708,9 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
   assert.equal(await page.evaluate(
     () => getComputedStyle(document.getElementById('cvInspector')).display), 'none',
   'snapshot mode rendered the inspector after selection');
-  assert.equal(await page.locator('#cvSave:visible').count(), 0, 'the snapshot still offers save');
+  assert.equal(await page.evaluate(
+    () => getComputedStyle(document.querySelector('.rtc-actions')).display), 'none',
+  'the snapshot still offers toolbar actions');
 
   /* 刷新同一 URL 仍能回放：图来自不可变快照，不依赖当前编辑中的 tree。 */
   await page.reload();
@@ -668,7 +738,9 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
     assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
       'a log snapshot opened the condition editor');
   }
-  assert.equal(await page.locator('#cvSave:visible').count(), 0, 'the snapshot still offers save');
+  assert.equal(await page.evaluate(
+    () => getComputedStyle(document.querySelector('.rtc-actions')).display), 'none',
+  'the snapshot still offers toolbar actions');
 });
 
 test('calculation-log snapshot replays from SQLite after a real router restart', async () => {
@@ -678,8 +750,7 @@ test('calculation-log snapshot replays from SQLite after a real router restart',
     stream: false,
   });
   await page.goto(routerBase + '/console/logs.html');
-  await page.locator('.lg-row').first().click();
-  const link = page.locator('.lg-item.open .lg-snapshot-link');
+  const link = page.locator('.lg-item .lg-snap-btn').first();
   await link.waitFor({ state: 'visible' });
   await Promise.all([page.waitForURL(/routing\.html\?request=/), link.click()]);
   await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final', { timeout: 15000 });

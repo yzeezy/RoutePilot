@@ -13,6 +13,7 @@ import { LANG, onLangChange, t, tf } from '../i18n.js';
 import * as RTGraph from './graph.js';
 import { DraftStore } from './draft.js';
 import { RoutingController } from './controller.js';
+import { addRuntimeModel } from './runtime.js';
 import { escape as esc, nodeName, render as renderCards } from './cards.js';
 import { create as createCanvas } from './canvas.js';
 import {
@@ -90,12 +91,15 @@ function kindLabel(kind) {
   return item ? t(item.labelKey) : kind;
 }
 
-/* ── 检查器目录：当前树的内嵌运行配置优先，旧草稿沿用全局目录 ─────
-   树有 runtime 时，模型/时段以文档自带的 backends/time_periods 为准（与运行快照
-   消费同一事实源）；新草稿/旧图没有 runtime 才回退 /admin/models 与
-   /admin/time-periods 的全局目录。 */
+/* ── 目录：数据库目录（/admin/*）与当前树内嵌运行快照 ─────────────────
+   严格自包含画布的编辑语义：
+     · 检查器「模型」下拉来自数据库模型目录（选择 target 模型时把目录项补进
+       画布快照；同 ID 已存在时不覆盖，数据库差异只作为 /admin/try 的检查提示）；
+     · 「JEV」下拉来自数据库 JEV 目录（应用时原子替换 runtime.jev/jev_window）；
+     · 时段复选框以画布 runtime.time_periods 为准 —— 画布引用未声明的时段会被
+       服务端拒绝，所以不能拿全局时段目录当选项源。
+   目录在 boot 时并行加载（app.catalog），新画布创建前必须 await。 */
 function currentRuntime() {
-  /* 旧 graph.js（未带自包含 runtime）也能跑：缺少视图函数时退回全局目录。 */
   if (!store.tree || typeof RTGraph.runtimeBehaviorView !== 'function') return null;
   return RTGraph.runtimeBehaviorView(store.tree);
 }
@@ -150,33 +154,67 @@ function runtimeModels() {
     runtimeModelOption(model, providerFormatOf(runtime, model && model.provider)));
 }
 
-/* 检查器消费者只需要 id / reasoning / profile：runtime 投影与 /admin/models 同形。 */
-function effectiveModels() {
-  const models = runtimeModels();
-  return models || app.models || [];
+/* 数据库模型目录 → 检查器形状；provider 协议取数据库 provider 声明。 */
+function catalogModels() {
+  const providers = (app.catalog && app.catalog.providers) || [];
+  return ((app.catalog && app.catalog.models) || []).map(model => {
+    const provider = providers.find(item => item && item.name === model.provider);
+    return runtimeModelOption(model, provider ? provider.reasoning_format : 'openai');
+  });
 }
 
+/* 检查器模型下拉 = 数据库模型目录（spec「模型下拉框来自数据库模型目录」）。
+   画布快照里数据库已不存在的模型由 modelRowHTML 的「当前值」兜底选项展示。 */
+function inspectorModels() {
+  return catalogModels();
+}
+
+/* 时段选项只认画布运行快照：引用未声明时段会被服务端校验拒绝。 */
 function effectivePeriods() {
   const runtime = currentRuntime();
-  if (!runtime) return app.periods || [];
+  if (!runtime) return [];
   return (Array.isArray(runtime.time_periods) ? runtime.time_periods : [])
     .map(period => (period && period.name) || '')
     .filter(Boolean);
 }
 
+/* 新建 target 的默认模型：优先画布快照里已有的模型（不改快照即可执行），
+   否则用数据库目录第一个（由调用方在同一次 change 里补进快照）。 */
 function defaultModelId() {
-  const models = effectiveModels();
-  if (models.length) return models[0].id;
-  return 'qwen3-8b';
+  const runtimeModelsList = runtimeModels() || [];
+  if (runtimeModelsList.length) return runtimeModelsList[0].id;
+  const models = inspectorModels();
+  return models.length ? models[0].id : '';
 }
 
 function reasoningFor(modelId) {
-  const model = effectiveModels().find(item => item && item.id === modelId);
+  const runtimeModel = (runtimeModels() || []).find(item => item && item.id === modelId);
+  const model = runtimeModel || inspectorModels().find(item => item && item.id === modelId);
   if (!model) return null;
   const reasoning = model.reasoning ||
     (model.profile && typeof model.profile === 'object' ? model.profile.reasoning : null);
   if (!reasoning || reasoning.declared === false || reasoning.supported === false) return null;
   return reasoning.default || null;
+}
+
+/* 把 target 引用的模型及其 provider 的非密钥目录信息补进画布快照。
+   同 ID 已存在时 addRuntimeModel 不覆盖旧快照（数据库漂移只做检查提示）。 */
+function targetModelIds(node) {
+  if (!node || node.type !== 'target' || !Array.isArray(node.models)) return [];
+  return node.models.map(item => item && item.model).filter(Boolean);
+}
+
+function embedRuntimeModels(tree, modelIds) {
+  if (!tree || !tree.runtime || !modelIds || !modelIds.length) return;
+  const models = (app.catalog && app.catalog.models) || [];
+  const providers = (app.catalog && app.catalog.providers) || [];
+  modelIds.forEach(id => {
+    const model = models.find(item => item && item.id === id);
+    if (!model) return;
+    const provider = providers.find(item => item && item.name === model.provider);
+    if (!provider) return;
+    tree.runtime = addRuntimeModel(tree.runtime, model, provider);
+  });
 }
 
 function nextPriority(graph) {
@@ -261,7 +299,6 @@ function makeNode(kind, position, graph, forcedId) {
       type: 'target',
       models: [targetModel],
       priority: nextPriority(graph),
-      strategy: 'least_inflight',
       position: point
     };
   } else {
@@ -290,6 +327,10 @@ let confirmState = null;
 /* 装配层暴露给模块与测试观察的只读视图；没有 window 全局。 */
 const app = {
   kit: null,
+  /* 数据库目录（/admin/providers、/admin/models、/admin/jev、/admin/time-periods）。
+     catalogReady 是 boot 里创建的 Promise：新画布创建前必须 await。 */
+  catalog: { providers: [], models: [], services: [], periods: [] },
+  catalogReady: null,
   models: [],
   periods: [],
   issues: [],
@@ -337,7 +378,7 @@ const hooks = {
   isInspectorEditing: () => inspectorEditing(),
   fitAfterReplace: () => fitAfterReplace(),
   renderTreeSelect: () => renderTreeSelect(),
-  getModels: () => app.models,
+  getCatalog: () => app.catalog,
   change: (kind, mutate) => app.change(kind, mutate),
 };
 
@@ -742,51 +783,105 @@ function updateToolbar() {
     redo.disabled = busy || !store.canRedo;
     redo.title = t('cv.redoTitle');
   }
-  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvLoadExample', 'cvImport', 'cvExport', 'cvTryBtn']
+  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvImport', 'cvExport', 'cvTryBtn',
+    'cvDisable', 'cvDefault']
     .forEach(id => {
       const button = document.getElementById(id);
       if (button) button.disabled = busy;
     });
-  /* 保存/启用请求在途：顶栏必须可见地进入忙碌态，双击不会再发第二个请求。 */
+  /* 保存/启用请求在途：顶栏的 #cvSave 仍要显示忙碌文案，
+     主按钮的 aria-busy 由 paintLifecycle() 统一暴露。 */
   const save = $('#cvSave');
   if (save) {
     save.setAttribute('aria-busy', String(!!store.saving));
     save.classList.toggle('is-saving', !!store.saving);
     const label = save.querySelector('span[data-i18n]');
-    if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.save');
+    if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.saveDraft');
   }
-  const enableLabel = $('#cvEnableLabel');
+  const disable = $('#cvDisable');
+  if (disable) disable.hidden = !(store.tree && store.tree.enabled);
+  /* 多图生命周期：默认可切换，但默认图本身不再提供「设为默认」；设默认隐含
+     启用，所以只在已启用且非默认的图上显示（禁用图先走主按钮启用）。
+     默认 pill 与按钮互补：当前图是默认图时显示。 */
+  const defaultButton = $('#cvDefault');
+  if (defaultButton) {
+    defaultButton.hidden = !(store.tree && store.tree.enabled && !store.tree.default);
+  }
+  const defaultPill = $('#cvDefaultPill');
+  if (defaultPill) {
+    /* 只读日志回放不宣传实时生命周期（与隐藏 #cvLifecycle 同一原则）。 */
+    defaultPill.hidden = isLogSnapshot() || !(store.tree && store.tree.default);
+  }
+  paintLifecycle();
+  applyTryScope();
+}
+
+/* 试算范围（Task 9）：draft 保持既有全草稿请求；route_set 只按部门/默认图从
+   已发布路由集选图，因此部门输入只在 route_set 模式下显示并可用。运行/保存在途
+   时范围与部门一起禁用（由 updateToolbar 统一调用，tryrun.setBusy 会再次触发）。 */
+function applyTryScope() {
+  const scope = $('#cvTryScope');
+  if (!scope) return;
+  const department = $('#cvTryDepartment');
+  const label = $('#cvTryDepartmentLabel');
+  const routeSet = scope.value === 'route_set';
+  const busy = !!(store.tryRunning || store.saving);
+  scope.disabled = busy;
+  if (label) label.hidden = !routeSet;
+  if (department) {
+    department.hidden = !routeSet;
+    department.disabled = !routeSet || busy;
+  }
+}
+
+function bindTryScope() {
+  const scope = $('#cvTryScope');
+  if (!scope) return;
+  scope.addEventListener('change', applyTryScope);
+  applyTryScope();
+}
+
+/* 顶栏状态只由 store 的持久化视图投影：启用与否 + 草稿是否干净 + 是否落过盘。
+   dirtyKind 仍保留 behavior/layout/display 分类，供保存语义与 beforeunload 使用；
+   这里只把它折叠成用户需要看的四种生命周期，不再另设第五种“仅布局”状态。
+   未启用优先：只要落过盘（store.saved）就显示 disabled，无论草稿是否有本地
+   改动（脏状态由主按钮「保存并启用 / 保存并更新」表达）；draft 只留给从未
+   保存过的新草稿。 */
+function lifecycleState() {
   const enabled = !!(store.tree && store.tree.enabled);
-  if (enableLabel) enableLabel.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
-  const enable = $('#cvEnable');
-  if (enable) enable.classList.toggle('is-on', enabled);
-  const enabledPill = $('#cvEnabled');
-  const enabledText = $('#cvEnabledLabel');
-  if (enabledPill) {
-    enabledPill.hidden = false;
-    enabledPill.classList.toggle('ok', enabled);
-    enabledPill.classList.toggle('warn', !enabled);
+  const clean = store.dirtyKind === 'clean';
+  if (enabled) return clean ? 'running' : 'unpublished';
+  return store.saved ? 'disabled' : 'draft';
+}
+
+function paintLifecycle() {
+  const state = lifecycleState();
+  const badge = $('#cvLifecycle');
+  const label = $('#cvLifecycleLabel');
+  if (label) label.textContent = t('cv.status.' + state);
+  if (badge) {
+    badge.dataset.state = state;
+    badge.classList.toggle('ok', state === 'running');
+    badge.classList.toggle('warn', state === 'unpublished' || state === 'draft');
+    const revision = store.tree && store.tree.tree_revision;
+    badge.title = revision ? tf('cv.revision', { rev: String(revision).slice(0, 10) }) : t('cv.unpublished');
   }
-  if (enabledText) enabledText.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
-  const revision = $('#cvRevision');
-  if (revision) {
-    revision.textContent = store.tree && store.tree.tree_revision
-      ? tf('cv.revision', { rev: String(store.tree.tree_revision).slice(0, 10) })
-      : t('cv.unpublished');
+  const enabled = !!(store.tree && store.tree.enabled);
+  const dirty = store.dirtyKind !== 'clean' || !store.saved;
+  const primaryKey = store.saving ? 'cv.saving'
+    : enabled ? (dirty ? 'cv.publishUpdate' : 'cv.published')
+    : (dirty ? 'cv.publish' : 'cv.enable');
+  const primary = $('#cvEnable');
+  const primaryLabel = $('#cvEnableLabel');
+  if (primaryLabel) primaryLabel.textContent = t(primaryKey);
+  if (primary) {
+    primary.setAttribute('aria-busy', String(!!store.saving));
+    primary.disabled = !!store.tryRunning || !!store.saving || (enabled && !dirty);
   }
 }
 
 function refreshDirty() {
   if (!store.tree) return;
-  const kind = store.dirtyKind;
-  const badge = $('#cvDirty');
-  if (badge) {
-    badge.hidden = kind === 'clean';
-    badge.dataset.kind = kind;
-    badge.textContent = kind === 'layout' ? t('cv.dirtyLayout') : t('cv.dirty');
-  }
-  const clean = $('#cvClean');
-  if (clean) clean.hidden = kind !== 'clean';
   updateToolbar();
 }
 
@@ -843,8 +938,12 @@ function restoreDeleteFocus() {
     trigger.focus();
     return;
   }
-  const fallback = $('#cvSave');
-  if (fallback) fallback.focus();
+  const fallback = $('#cvEnable');
+  /* 主按钮在「已启用且无改动」时是禁用的（Enabled 只是一个状态），focus()
+     落在禁用按钮上是空操作、焦点会掉回 body，所以再退到常驻可聚焦的控件。 */
+  if (fallback && !fallback.disabled) { fallback.focus(); return; }
+  const alwaysFocusable = $('#cvIssuesBtn');
+  if (alwaysFocusable) alwaysFocusable.focus();
 }
 
 function onDeleteKeydown(event) {
@@ -989,8 +1088,8 @@ function confirmDelete() {
   if (cleared.length) toast(t('cv.toastFallbackCleared'), 'warn');
   else toast(t('cv.toastDeleted'));
   /* 确认删除后触发按钮可能随卡片重绘消失：回到顶栏的稳定焦点位。 */
-  const save = $('#cvSave');
-  if (save && document.contains(save)) save.focus();
+  const enable = $('#cvEnable');
+  if (enable && document.contains(enable)) enable.focus();
 }
 
 /* ── 快速创建（输出端口拖到空白） ─────────────────────────────── */
@@ -1059,6 +1158,7 @@ function createQuick(kind) {
     createdNode = makeNode(kind, { x: context.x + 24, y: context.y - 40 }, tree.root);
     if (!createdNode) return;
     tree.root.nodes.push(createdNode);
+    embedRuntimeModels(tree, targetModelIds(createdNode));
     const result = RTGraph.addEdge(tree.root, {
       source: context.sourceNodeId,
       source_port: context.sourcePort,
@@ -1083,7 +1183,11 @@ function createFromLibrary(kind, position) {
   let created = null;
   change('behavior', tree => {
     created = makeNode(kind, position, tree.root);
-    if (created) tree.root.nodes.push(created);
+    if (created) {
+      tree.root.nodes.push(created);
+      /* 新 target 引用的模型（及其 provider）必须在同一次历史项里补进画布快照。 */
+      embedRuntimeModels(tree, targetModelIds(created));
+    }
   });
   if (!created) return;
   app.kit.select('node', created.id);
@@ -1237,10 +1341,9 @@ function closeOverlays() {
   return false;
 }
 
-/* ── 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） ───────────── */
+/* ── 丢弃草稿确认（切组 / 导入 / 新建共用） ─────────────────────── */
 const CONFIRM_TITLES = {
   switch: 'cv.confirmSwitchTitle',
-  example: 'cv.confirmExampleTitle',
   import: 'cv.confirmImportTitle',
   new: 'cv.confirmNewTitle'
 };
@@ -1280,7 +1383,7 @@ function settleConfirm(ok) {
   if (state) state.resolve(!!ok);
 }
 
-/* 导入/载入示例替换整张图后回到「看得见全图」的视口（保持检查器/节点库安全区）。 */
+/* 导入替换整张图后回到「看得见全图」的视口（保持检查器/节点库安全区）。 */
 function fitAfterReplace() {
   if (!app.kit || typeof app.kit.fit !== 'function') return;
   app.kit.fit({ padding: 24 });
@@ -1318,7 +1421,7 @@ function bindToolbar() {
   });
   $('#cvAutoLayout').addEventListener('click', autoLayout);
   /* boot 完成（store.tree 已装配）前，替换整张图的入口一律拒绝：
-     newTree/loadExample/import 都会写草稿，此时 change() 没有可操作对象。 */
+     newTree/import 都会写草稿，此时 change() 没有可操作对象。 */
   const requireBooted = action => function () {
     if (!app.booted) {
       toast(t('cv.toastNotReady'), 'warn');
@@ -1327,12 +1430,17 @@ function bindToolbar() {
     return action.apply(null, arguments);
   };
   const actions = {
-    cvNewTree: requireBooted(() => controller.newTree()),
-    cvLoadExample: requireBooted(() => controller.loadExample()),
+    /* 新建画布必须等数据库目录：目录未到就点「新建」时排队等待而不是造空 runtime。 */
+    cvNewTree: requireBooted(async () => {
+      try { await app.catalogReady; } catch (error) { /* newDraftTree 给出明确错误 */ }
+      return controller.newTree();
+    }),
     cvImport: requireBooted(() => controller.openImport()),
     cvExport: () => controller.exportTree(),
     cvSave: () => controller.save(),
-    cvEnable: () => controller.enable()
+    cvEnable: () => controller.enable(),
+    cvDefault: () => controller.setDefault(),
+    cvDisable: () => controller.disable()
   };
   Object.keys(actions).forEach(id => {
     const button = document.getElementById(id);
@@ -1440,8 +1548,11 @@ function bindTryBar() {
 function renderTreeSelect() {
   const select = $('#cvTreeSelect');
   if (!select) return;
+  /* 多图生命周期：默认图加「默认」标记。当前编辑图由 controller.treeId 决定，
+     不再从唯一 enabled 图推导（可同时启用多张图）。 */
+  const label = tree => esc(tree.name || tree.id) + (tree.default ? esc(t('cv.treeDefault')) : '');
   const options = (controller.trees || []).map(tree =>
-    '<option value="' + esc(tree.id) + '">' + esc(tree.name || tree.id) + '</option>').join('');
+    '<option value="' + esc(tree.id) + '">' + label(tree) + '</option>').join('');
   select.innerHTML = options;
   if (controller.treeId && !(controller.trees || []).some(tree => tree.id === controller.treeId)) {
     select.innerHTML += '<option value="' + esc(controller.treeId) + '">' +
@@ -1470,6 +1581,7 @@ function bindEvents() {
   bindTreeSelect();
   bindOverlays();
   bindTryBar();
+  bindTryScope();
   /* 只有存在未保存改动（clean 之外）时才拦截关闭/刷新。 */
   window.addEventListener('beforeunload', event => {
     if (!store.tree || store.dirtyKind === 'clean') return;
@@ -1479,6 +1591,8 @@ function bindEvents() {
   onLangChange(() => {
     if (!app.booted) return;
     renderPalette();
+    /* 决策组下拉框的「默认」标记是 UI 文案（组名本身是数据），语言切换必须重绘。 */
+    renderTreeSelect();
     refreshTryRun();
     renderAll();
     refreshDirty();
@@ -1513,12 +1627,16 @@ function createKit() {
     store: store,
     getGraph: () => store.graph,
     getTree: () => store.tree,
-    /* 当前树的 runtime 优先；旧草稿回退全局目录（见顶部 effectiveModels）。 */
-    getModels: () => effectiveModels(),
+    /* 模型目录来自数据库（选择时补进画布快照）；时段来自画布运行快照。 */
+    getModels: () => inspectorModels(),
     getPeriods: () => effectivePeriods(),
+    getProviders: () => (app.catalog && app.catalog.providers) || [],
+    getJevServices: () => (app.catalog && app.catalog.services) || [],
+    getCatalog: () => app.catalog,
     getSelection: () => (app.kit ? app.kit.getSelection() : app.selection),
     requestDelete: selection => requestDelete(selection),
     addEdge: draft => app.kit.addEdge(draft),
+    toast: (message, tone) => toast(message, tone),
   });
   configureTryRun({
     store: store,
@@ -1592,44 +1710,77 @@ async function bootLogSnapshot() {
   }
 }
 
+/* 数据库目录：providers / models / JEV 服务 / 时段。四个端点相互独立，任一失败
+   只让对应目录为空（不阻断画布加载）；新画布创建前必须 await 这个 Promise。 */
+async function loadCatalog() {
+  const [providers, models, services, periods] = await Promise.all([
+    api.get('/admin/providers').then(result => result.providers || []).catch(() => []),
+    api.get('/admin/models').then(result => result.models || []).catch(() => []),
+    api.get('/admin/jev').then(result => result.services || []).catch(() => []),
+    api.get('/admin/time-periods').then(result => result.periods || []).catch(() => [])
+  ]);
+  app.catalog = {
+    providers: Array.isArray(providers) ? providers : [],
+    models: Array.isArray(models) ? models : [],
+    services: Array.isArray(services) ? services : [],
+    periods: Array.isArray(periods) ? periods : []
+  };
+  app.models = app.catalog.models;
+  app.periods = app.catalog.periods
+    .map(period => (period && period.name) || '')
+    .filter(Boolean);
+  return app.catalog;
+}
+
+/* boot 兜底 / 新建：创建新画布必须等数据库目录就绪；目录为空或缺少 provider 时
+   controller.newDraftTree() 抛明确错误，这里提示并把画布留在「无草稿」状态。 */
+async function loadDraftTree() {
+  try {
+    await app.catalogReady;
+  } catch (error) { /* 目录加载失败时由 newDraftTree 给出明确错误 */ }
+  try {
+    controller.loadTree(controller.newDraftTree(), false);
+    return true;
+  } catch (error) {
+    toast(String(error && error.message ? error.message : error), 'error');
+    return false;
+  }
+}
+
 async function boot() {
   createKit();
   if (isLogSnapshot()) return bootLogSnapshot();
   bindEvents();
   renderPalette();
-  /* 模型目录与决策组解耦：/admin/models 抖动不能回退或清空已加载的草稿。 */
-  const modelsReady = api.get('/admin/models')
-    .then(result => { app.models = result.models || []; })
-    .catch(() => { app.models = []; });
-  const periodsReady = api.get('/admin/time-periods')
-    .then(result => {
-      app.periods = (result.periods || []).map(period => period && period.name).filter(Boolean);
-    })
-    .catch(() => { app.periods = []; });
+  /* 目录与决策组解耦：目录抖动不能清空已加载的草稿；只有「新建画布」需要目录。 */
+  app.catalogReady = loadCatalog();
   try {
     const treeResult = await api.get('/admin/trees');
     controller.trees = treeResult.trees || [];
     controller.snapshotRevision = treeResult.snapshot_revision || '';
     renderTreeSelect();
-    const enabled = controller.trees.find(tree => tree.enabled) || controller.trees[0];
-    if (enabled) {
-      const result = await api.get('/admin/trees/' + encodeURIComponent(enabled.id));
+    /* 多图生命周期：启动优先打开默认图（公开 /v1 使用的图），没有默认图时退回
+       列表第一张。不能用「第一张 enabled 图」推导 —— 有多张启用图时顺序不代表
+       默认关系，而且第一张启用的图未必是默认图。 */
+    const preferred = controller.trees.find(tree => tree.default) || controller.trees[0];
+    if (preferred) {
+      const result = await api.get('/admin/trees/' + encodeURIComponent(preferred.id));
       const tree = result && result.tree;
       if (tree && tree.root) controller.loadTree(tree, true);
-      else controller.loadTree(controller.newDraftTree(), false);
+      else await loadDraftTree();
     } else {
-      controller.loadTree(controller.newDraftTree(), false);
+      await loadDraftTree();
     }
   } catch (error) {
     controller.trees = [];
     toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
-    controller.loadTree(controller.newDraftTree(), false);
+    await loadDraftTree();
   }
-  /* 树加载完成即解锁画布与节点库；模型/时段目录只影响检查器选项，不能阻塞建模。 */
+  /* 树加载完成即解锁画布与节点库；目录只影响检查器选项与新画布。 */
   app.booted = true;
-  await Promise.all([modelsReady, periodsReady]);
+  await app.catalogReady;
   if (!store.tree) return;
-  /* 模型/时段目录晚到：重绘一次让检查器的下拉框拿到最新选项。
+  /* 目录晚到：重绘一次让检查器的下拉框拿到最新选项。
      若用户正在检查器里编辑，跳过这次重绘（下一次选择/保存自然带上新目录），
      否则会清掉还没提交的输入。 */
   if (inspectorEditing()) return;
@@ -1637,6 +1788,12 @@ async function boot() {
   refreshDirty();
 }
 
+/* 模块在 </body> 前加载，DOM 已就绪：先同步画一次首屏文案，再进入异步 boot。
+   #cvEnableLabel 没有静态种子也没有 data-i18n（唯一 owner 是 paintLifecycle）,
+   此时 store.tree 仍是 null，函数会落到 markup 声明的 draft / cv.publish；
+   语言已由 nav.js 的 setLang(LANG) 在 import 阶段定好，所以英文会话从第一帧
+   起就是英文，而不是先闪一帧中文再被 boot 后的 paintLifecycle 覆盖。 */
+paintLifecycle();
 boot();
 
 /* 装配层视图对象（无 window 全局）：供模块间回调与测试观察使用。 */
